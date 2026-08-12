@@ -1,3 +1,4 @@
+```python
 import os
 import logging
 
@@ -28,17 +29,18 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Pokazuje tylko czy zmienna istnieje.
-# NIE pokazuje wartości tokenów ani kluczy.
+# Używamy nowej nazwy zmiennej w Render:
+# MY_OPENAI_KEY
+OPENAI_API_KEY = os.getenv("MY_OPENAI_KEY")
+
 logger.info(
     "TELEGRAM_TOKEN dostępny: %s",
     bool(TELEGRAM_TOKEN),
 )
 
 logger.info(
-    "OPENAI_API_KEY dostępny: %s",
+    "MY_OPENAI_KEY dostępny: %s",
     bool(OPENAI_API_KEY),
 )
 
@@ -50,7 +52,7 @@ if not TELEGRAM_TOKEN:
 
 if not OPENAI_API_KEY:
     raise RuntimeError(
-        "Brak OPENAI_API_KEY w Environment Variables na Render."
+        "Brak MY_OPENAI_KEY w Environment Variables na Render."
     )
 
 
@@ -64,13 +66,16 @@ client = AsyncOpenAI(
 
 
 # --------------------------------------------------
-# /START
+# KOMENDA /START
 # --------------------------------------------------
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message:
+        return
+
     await update.message.reply_text(
         "Cześć! 👋\n\n"
         "Jestem Trading AI Analyzer.\n"
@@ -79,7 +84,7 @@ async def start(
 
 
 # --------------------------------------------------
-# WIADOMOŚCI
+# ODPOWIEDZI AI
 # --------------------------------------------------
 
 async def answer(
@@ -91,21 +96,20 @@ async def answer(
 
     text = update.message.text
 
-    await update.message.chat.send_action(
-        action="typing"
-    )
-
     try:
+        await update.message.chat.send_action(
+            action="typing"
+        )
+
         response = await client.responses.create(
             model="gpt-5-mini",
             instructions=(
                 "Odpowiadaj po polsku. "
-                "Jesteś pomocnym asystentem AI. "
-                "Jeżeli użytkownik pyta o trading, giełdę, "
-                "kryptowaluty, złoto, forex lub analizę rynku, "
-                "wyraźnie oddzielaj fakty od przypuszczeń. "
-                "Nie gwarantuj zysków. "
-                "Odpowiadaj jasno i konkretnie."
+                "Jesteś pomocnym asystentem AI o nazwie Trading AI Analyzer. "
+                "Jeśli użytkownik pyta o trading, forex, złoto, indeksy, "
+                "kryptowaluty lub analizę rynku, odpowiadaj jasno i konkretnie. "
+                "Wyraźnie oddzielaj fakty od przypuszczeń. "
+                "Nie gwarantuj zysków i nie przedstawiaj spekulacji jako pewników."
             ),
             input=text,
         )
@@ -124,18 +128,18 @@ async def answer(
 
     except Exception as error:
         logger.exception(
-            "Błąd podczas połączenia z OpenAI: %s",
+            "Błąd OpenAI: %s",
             error,
         )
 
         await update.message.reply_text(
-            "Wystąpił błąd podczas łączenia z OpenAI.\n"
+            "Wystąpił błąd podczas łączenia z OpenAI. "
             "Sprawdź logi Render."
         )
 
 
 # --------------------------------------------------
-# OBSŁUGA BŁĘDÓW TELEGRAMA
+# OBSŁUGA BŁĘDÓW
 # --------------------------------------------------
 
 async def error_handler(
@@ -149,11 +153,13 @@ async def error_handler(
 
 
 # --------------------------------------------------
-# START BOTA
+# URUCHOMIENIE BOTA
 # --------------------------------------------------
 
 def main():
-    logger.info("Uruchamianie Trading AI Analyzer...")
+    logger.info(
+        "Uruchamianie Trading AI Analyzer..."
+    )
 
     application = (
         Application.builder()
@@ -162,7 +168,10 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     application.add_handler(
@@ -176,7 +185,9 @@ def main():
         error_handler
     )
 
-    logger.info("Bot działa i oczekuje na wiadomości.")
+    logger.info(
+        "Bot działa i oczekuje na wiadomości."
+    )
 
     application.run_polling(
         drop_pending_updates=True
@@ -185,3 +196,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
