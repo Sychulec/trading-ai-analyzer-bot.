@@ -80,7 +80,12 @@ async def answer(
             "OpenAI nie zwrócił odpowiedzi. Spróbuj ponownie."
         )
 
-        await update.message.reply_text(answer_text)
+        # Telegram ma limit długości pojedynczej wiadomości.
+        # Dłuższe odpowiedzi wysyłamy w częściach.
+        for i in range(0, len(answer_text), 4000):
+            await update.message.reply_text(
+                answer_text[i:i + 4000]
+            )
 
     except Exception as error:
         logger.exception("Błąd OpenAI: %s", error)
