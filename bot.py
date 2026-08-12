@@ -1,5 +1,8 @@
 import os
 import logging
+import urllib.parse
+import urllib.request
+import json
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -20,9 +23,11 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 logger.info("TELEGRAM_TOKEN dostępny: %s", bool(TELEGRAM_TOKEN))
 logger.info("OPENAI_API_KEY dostępny: %s", bool(OPENAI_API_KEY))
+logger.info("TWELVE_DATA_API_KEY dostępny: %s", bool(TWELVE_DATA_API_KEY))
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -34,7 +39,37 @@ if not OPENAI_API_KEY:
         "Brak OPENAI_API_KEY w Environment Variables na Render."
     )
 
+if not TWELVE_DATA_API_KEY:
+    raise RuntimeError(
+        "Brak TWELVE_DATA_API_KEY w Environment Variables na Render."
+    )
+
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_xauusd_price():
+    params = urllib.parse.urlencode(
+        {
+            "symbol": "XAU/USD",
+            "apikey": TWELVE_DATA_API_KEY,
+        }
+    )
+
+    url = f"https://api.twelvedata.com/price?{params}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        if "price" in data:
+            return data["price"]
+
+        logger.error("Błąd Twelve Data: %s", data)
+        return None
+
+    except Exception as error:
+        logger.exception("Błąd pobierania ceny XAU/USD: %s", error)
+        return None
 
 
 async def start(
@@ -47,7 +82,8 @@ async def start(
     await update.message.reply_text(
         "Cześć! 👋\n\n"
         "Jestem Trading AI Analyzer.\n"
-        "Wyślij mi pytanie, a odpowiem przy pomocy AI."
+        "Mogę analizować rynek przy pomocy AI "
+        "oraz pobierać aktualną cenę XAU/USD."
     )
 
 
@@ -63,6 +99,24 @@ async def answer(
     try:
         await update.message.chat.send_action(action="typing")
 
+        xauusd_price = get_xauusd_price()
+
+        if xauusd_price:
+            market_data = (
+                f"Aktualna cena XAU/USD z Twelve Data: "
+                f"{xauusd_price} USD za uncję."
+            )
+        else:
+            market_data = (
+                "Nie udało się pobrać aktualnej ceny XAU/USD "
+                "z Twelve Data."
+            )
+
+        prompt = (
+            f"Pytanie użytkownika:\n{text}\n\n"
+            f"Dane rynkowe:\n{market_data}"
+        )
+
         response = await client.responses.create(
             model="gpt-5-mini",
             instructions=(
@@ -70,28 +124,28 @@ async def answer(
                 "Jesteś pomocnym asystentem AI o nazwie Trading AI Analyzer. "
                 "Jeżeli użytkownik pyta o trading, forex, złoto, indeksy, "
                 "kryptowaluty lub analizę rynku, odpowiadaj jasno i konkretnie. "
+                "Jeżeli otrzymasz aktualne dane rynkowe, wykorzystaj je w analizie. "
+                "Nie udawaj, że masz dostęp do danych, których nie otrzymałeś. "
                 "Wyraźnie oddzielaj fakty od przypuszczeń. "
                 "Nie gwarantuj zysków."
             ),
-            input=text,
+            input=prompt,
         )
 
         answer_text = response.output_text or (
             "OpenAI nie zwrócił odpowiedzi. Spróbuj ponownie."
         )
 
-        # Telegram ma limit długości pojedynczej wiadomości.
-        # Dłuższe odpowiedzi wysyłamy w częściach.
         for i in range(0, len(answer_text), 4000):
             await update.message.reply_text(
                 answer_text[i:i + 4000]
             )
 
     except Exception as error:
-        logger.exception("Błąd OpenAI: %s", error)
+        logger.exception("Błąd OpenAI lub danych rynkowych: %s", error)
 
         await update.message.reply_text(
-            "Wystąpił błąd podczas łączenia z OpenAI. "
+            "Wystąpił błąd podczas analizy. "
             "Sprawdź logi Render."
         )
 
