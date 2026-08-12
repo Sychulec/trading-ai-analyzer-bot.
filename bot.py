@@ -1,4 +1,3 @@
-
 import os
 import logging
 
@@ -12,10 +11,6 @@ from telegram.ext import (
     filters,
 )
 
-# --------------------------------------------------
-# LOGI
-# --------------------------------------------------
-
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -23,27 +18,11 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
-# --------------------------------------------------
-# ZMIENNE ŚRODOWISKOWE
-# --------------------------------------------------
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Używamy nowej nazwy zmiennej w Render:
-# MY_OPENAI_KEY
-OPENAI_API_KEY = os.getenv("MY_OPENAI_KEY")
-
-logger.info(
-    "TELEGRAM_TOKEN dostępny: %s",
-    bool(TELEGRAM_TOKEN),
-)
-
-logger.info(
-    "MY_OPENAI_KEY dostępny: %s",
-    bool(OPENAI_API_KEY),
-)
-
+logger.info("TELEGRAM_TOKEN dostępny: %s", bool(TELEGRAM_TOKEN))
+logger.info("OPENAI_API_KEY dostępny: %s", bool(OPENAI_API_KEY))
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -52,22 +31,11 @@ if not TELEGRAM_TOKEN:
 
 if not OPENAI_API_KEY:
     raise RuntimeError(
-        "Brak MY_OPENAI_KEY w Environment Variables na Render."
+        "Brak OPENAI_API_KEY w Environment Variables na Render."
     )
 
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# --------------------------------------------------
-# OPENAI
-# --------------------------------------------------
-
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY
-)
-
-
-# --------------------------------------------------
-# KOMENDA /START
-# --------------------------------------------------
 
 async def start(
     update: Update,
@@ -83,10 +51,6 @@ async def start(
     )
 
 
-# --------------------------------------------------
-# ODPOWIEDZI AI
-# --------------------------------------------------
-
 async def answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -97,50 +61,35 @@ async def answer(
     text = update.message.text
 
     try:
-        await update.message.chat.send_action(
-            action="typing"
-        )
+        await update.message.chat.send_action(action="typing")
 
         response = await client.responses.create(
             model="gpt-5-mini",
             instructions=(
                 "Odpowiadaj po polsku. "
                 "Jesteś pomocnym asystentem AI o nazwie Trading AI Analyzer. "
-                "Jeśli użytkownik pyta o trading, forex, złoto, indeksy, "
+                "Jeżeli użytkownik pyta o trading, forex, złoto, indeksy, "
                 "kryptowaluty lub analizę rynku, odpowiadaj jasno i konkretnie. "
                 "Wyraźnie oddzielaj fakty od przypuszczeń. "
-                "Nie gwarantuj zysków i nie przedstawiaj spekulacji jako pewników."
+                "Nie gwarantuj zysków."
             ),
             input=text,
         )
 
-        answer_text = response.output_text
-
-        if not answer_text:
-            answer_text = (
-                "OpenAI nie zwrócił odpowiedzi. "
-                "Spróbuj ponownie."
-            )
-
-        await update.message.reply_text(
-            answer_text
+        answer_text = response.output_text or (
+            "OpenAI nie zwrócił odpowiedzi. Spróbuj ponownie."
         )
+
+        await update.message.reply_text(answer_text)
 
     except Exception as error:
-        logger.exception(
-            "Błąd OpenAI: %s",
-            error,
-        )
+        logger.exception("Błąd OpenAI: %s", error)
 
         await update.message.reply_text(
             "Wystąpił błąd podczas łączenia z OpenAI. "
             "Sprawdź logi Render."
         )
 
-
-# --------------------------------------------------
-# OBSŁUGA BŁĘDÓW
-# --------------------------------------------------
 
 async def error_handler(
     update: object,
@@ -152,14 +101,8 @@ async def error_handler(
     )
 
 
-# --------------------------------------------------
-# URUCHOMIENIE BOTA
-# --------------------------------------------------
-
 def main():
-    logger.info(
-        "Uruchamianie Trading AI Analyzer..."
-    )
+    logger.info("Uruchamianie Trading AI Analyzer...")
 
     application = (
         Application.builder()
@@ -168,10 +111,7 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
@@ -181,13 +121,9 @@ def main():
         )
     )
 
-    application.add_error_handler(
-        error_handler
-    )
+    application.add_error_handler(error_handler)
 
-    logger.info(
-        "Bot działa i oczekuje na wiadomości."
-    )
+    logger.info("Bot działa i oczekuje na wiadomości.")
 
     application.run_polling(
         drop_pending_updates=True
