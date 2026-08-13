@@ -59,13 +59,14 @@ client = OpenAI(
 # =========================================================
 
 def send_telegram_message(text):
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    # Telegram ma limit długości wiadomości.
     for i in range(0, len(text), 4000):
         chunk = text[i:i + 4000]
-
-        url = (
-            f"https://api.telegram.org/"
-            f"bot{TELEGRAM_TOKEN}/sendMessage"
-        )
 
         data = urllib.parse.urlencode(
             {
@@ -112,6 +113,7 @@ def extract_number(pattern, text):
         return float(
             match.group(1).replace(",", ".")
         )
+
     except ValueError:
         return None
 
@@ -160,17 +162,17 @@ def parse_alert(text):
         else "?"
     )
 
-    entry = extract_number(
+    strategy_entry = extract_number(
         r"Cena:\s*([0-9.,]+)",
         text,
     )
 
-    tp = extract_number(
+    strategy_tp = extract_number(
         r"TP:\s*([0-9.,]+)",
         text,
     )
 
-    sl = extract_number(
+    strategy_sl = extract_number(
         r"SL:\s*([0-9.,]+)",
         text,
     )
@@ -180,65 +182,18 @@ def parse_alert(text):
         "side": side,
         "symbol": symbol,
         "timeframe": timeframe,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
+        "strategy_entry": strategy_entry,
+        "strategy_tp": strategy_tp,
+        "strategy_sl": strategy_sl,
         "raw": text,
     }
 
 
 # =========================================================
-# RISK / REWARD
+# ANALIZA SETUPU H1
 # =========================================================
 
-def calculate_rr(side, entry, sl, tp):
-    if (
-        entry is None
-        or sl is None
-        or tp is None
-    ):
-        return None
-
-    if side == "LONG":
-        risk = entry - sl
-        reward = tp - entry
-
-    elif side == "SHORT":
-        risk = sl - entry
-        reward = entry - tp
-
-    else:
-        return None
-
-    if risk <= 0:
-        return None
-
-    return reward / risk
-
-
-# =========================================================
-# ANALIZA AI
-# =========================================================
-
-def analyze_xauusd_signal(signal):
-    side = signal["side"]
-    entry = signal["entry"]
-    sl = signal["sl"]
-    tp = signal["tp"]
-
-    rr = calculate_rr(
-        side,
-        entry,
-        sl,
-        tp,
-    )
-
-    rr_text = (
-        f"{rr:.2f}"
-        if rr is not None
-        else "brak"
-    )
-
+def analyze_h1_setup(signal):
     try:
         market_results = build_market_analysis()
 
@@ -248,83 +203,172 @@ def analyze_xauusd_signal(signal):
 
     except Exception as error:
         logger.exception(
-            "Błąd danych rynkowych: %s",
+            "Błąd pobierania danych rynkowych: %s",
             error,
         )
+
+        send_telegram_message(
+            "⚠️ XAUUSD\n"
+            "Nie udało się pobrać danych rynkowych."
+        )
+
         return
 
     prompt = f"""
-SYGNAŁ Z TRADINGVIEW
+SYGNAŁ BAZOWY Z TRADINGVIEW
 
 Instrument: {signal["symbol"]}
 Timeframe sygnału: {signal["timeframe"]}
-Kierunek: {side}
+Kierunek strategii: {signal["side"]}
 
-ENTRY: {entry}
-STOP LOSS: {sl}
-TAKE PROFIT: {tp}
-RISK/REWARD: {rr_text}
+Cena sygnału strategii:
+{signal["strategy_entry"]}
+
+SL strategii:
+{signal["strategy_sl"]}
+
+TP strategii:
+{signal["strategy_tp"]}
+
 
 AKTUALNE DANE RYNKOWE:
 
 {market_data}
 
-Oceń ten konkretny sygnał TradingView
-na podstawie aktualnych danych rynkowych.
+
+ZADANIE
+
+Sygnał H1 z TradingView jest tylko sygnałem bazowym.
+
+Przeanalizuj aktualny rynek samodzielnie.
+
+H1 traktuj jako główny interwał kierunkowy.
+
+15m, 5m i 1m wykorzystaj do oceny jakości setupu
+oraz znalezienia możliwie sensownego momentu wejścia.
+
+Nie musisz kopiować ceny wejścia, SL ani TP
+podanych przez TradingView.
+
+Na podstawie aktualnych danych zaproponuj własny,
+technicznie uzasadniony plan albo odrzuć setup.
+"""
+
+    instructions = """
+Odpowiadaj po polsku.
+
+Jesteś Trading AI Analyzer.
+
+Analizujesz sygnał XAUUSD z H1.
+
+TradingView daje jedynie kierunek bazowy LONG albo SHORT.
+Nie traktuj ceny ENTRY, SL i TP strategii jako obowiązkowych.
+
+Najważniejszy jest interwał H1.
+Następnie sprawdź 15m, 5m i 1m w celu określenia
+timingu wejścia.
+
+Uwzględnij:
+- aktualną cenę,
+- EMA20,
+- EMA50,
+- RSI,
+- MACD,
+- histogram MACD,
+- orientacyjne wsparcia i opory,
+- zgodność wielu interwałów.
+
+Masz wybrać dokładnie jedną decyzję:
+
+✅ WEJŚCIE
+gdy aktualne warunki wystarczająco potwierdzają setup.
+
+⏳ CZEKAJ
+gdy kierunek H1 ma sens, ale obecna cena lub niższe
+interwały nie dają jeszcze dobrego wejścia.
+
+❌ POMIŃ
+gdy aktualne dane wyraźnie przeczą sygnałowi H1
+lub nie ma sensownego stosunku ryzyka do potencjalnego zysku.
+
+Jeśli wybierasz WEJŚCIE lub CZEKAJ:
+- podaj własną cenę wejścia albo wąską strefę wejścia,
+- podaj techniczny STOP LOSS,
+- podaj TP1,
+- podaj TP2,
+- podaj TP3.
+
+SL powinien znajdować się za logicznym poziomem
+unieważnienia setupu, a nie w przypadkowej odległości.
+
+TP1, TP2 i TP3 powinny wynikać z aktualnych danych,
+wsparć/oporów i rozsądnego risk/reward.
+
+Nie wymyślaj danych, których nie otrzymałeś.
+
+Jeżeli dane nie pozwalają wiarygodnie ustalić poziomu,
+napisz CZEKAJ albo POMIŃ zamiast zgadywać.
+
+Nie pisz długiej analizy.
+
+Odpowiedź ma być krótka i czytelna na telefonie.
+
+Użyj DOKŁADNIE tego układu:
+
+🟢 XAUUSD LONG — H1
+albo
+🔴 XAUUSD SHORT — H1
+
+Cena teraz: [cena]
+
+Decyzja: [✅ WEJŚCIE / ⏳ CZEKAJ / ❌ POMIŃ]
+
+Wejście AI: [cena lub strefa]
+SL: [cena]
+TP1: [cena]
+TP2: [cena]
+TP3: [cena]
+
+1m: [✅ / ⚠️ / ❌]
+5m: [✅ / ⚠️ / ❌]
+15m: [✅ / ⚠️ / ❌]
+1h: [✅ / ⚠️ / ❌]
+
+Warunek wejścia: [jedno krótkie zdanie]
+Unieważnienie: [jedno krótkie zdanie]
+
+Jeżeli decyzja to POMIŃ, nie wymuszaj sztucznych
+poziomów wejścia i TP. Możesz wpisać "-".
+
+Nie dodawaj wielostronicowego komentarza.
+Nie gwarantuj zysku.
 """
 
     try:
         response = client.responses.create(
             model="gpt-5-mini",
-            instructions=(
-                "Odpowiadaj po polsku. "
-                "Jesteś Trading AI Analyzer. "
-
-                "Otrzymujesz gotowy sygnał "
-                "ze strategii TradingView. "
-
-                "Nie zmieniaj arbitralnie ENTRY, SL ani TP. "
-
-                "Najpierw pokaż dokładnie: "
-                "KIERUNEK, ENTRY, SL, TP i R:R. "
-
-                "Następnie przeanalizuj osobno "
-                "1m, 5m, 15m i 1h. "
-
-                "Uwzględnij EMA20, EMA50, RSI i MACD. "
-
-                "Porównaj kierunek strategii z aktualnym "
-                "trendem i momentum. "
-
-                "Zwróć uwagę, czy cena nie odjechała "
-                "już za daleko od ENTRY. "
-
-                "Na końcu podaj jedną ocenę:\n"
-                "✅ SYGNAŁ POTWIERDZONY\n"
-                "⚠️ SYGNAŁ MIESZANY\n"
-                "❌ SYGNAŁ SŁABY\n"
-
-                "Krótko uzasadnij ocenę. "
-                "Nie gwarantuj zysku. "
-                "Nie wymyślaj danych."
-            ),
+            instructions=instructions,
             input=prompt,
         )
 
         answer = (
             response.output_text
-            or "OpenAI nie zwrócił analizy."
+            or "AI nie zwróciło analizy."
         )
 
         send_telegram_message(
-            "🤖 ANALIZA AI SYGNAŁU\n\n"
-            + answer
+            answer
         )
 
     except Exception as error:
         logger.exception(
             "Błąd OpenAI: %s",
             error,
+        )
+
+        send_telegram_message(
+            "⚠️ XAUUSD\n"
+            "Wystąpił błąd podczas analizy AI."
         )
 
 
@@ -345,8 +389,9 @@ def process_alert(text):
         signal,
     )
 
-    # Reagujemy WYŁĄCZNIE na nowe wejście.
-    # TP, SL i inne zamknięcia są ignorowane.
+    # Ignorujemy TP, SL i wszystkie inne alerty.
+    # Analiza uruchamia się tylko dla nowego wejścia.
+
     if signal["event"] != "ENTRY":
         logger.info(
             "Alert pominięty: %s",
@@ -354,7 +399,7 @@ def process_alert(text):
         )
         return
 
-    # Na razie analizujemy tylko XAUUSD.
+    # Tylko XAUUSD.
     if signal["symbol"] != "XAUUSD":
         logger.info(
             "Instrument pominięty: %s",
@@ -362,7 +407,26 @@ def process_alert(text):
         )
         return
 
-    analyze_xauusd_signal(
+    # Docelowo pracujemy na sygnale H1.
+    # Akceptujemy też "60", bo TradingView/Pine
+    # może oznaczać godzinę jako 60 minut.
+
+    timeframe = str(
+        signal["timeframe"]
+    ).lower()
+
+    if timeframe not in (
+        "1h",
+        "60",
+        "60m",
+    ):
+        logger.info(
+            "Pominięto sygnał spoza H1: %s",
+            timeframe,
+        )
+        return
+
+    analyze_h1_setup(
         signal
     )
 
@@ -379,7 +443,9 @@ def home():
     return jsonify(
         {
             "status": "ok",
-            "service": "Trading AI Analyzer Webhook",
+            "service": (
+                "Trading AI Analyzer Webhook"
+            ),
         }
     )
 
@@ -418,7 +484,10 @@ def webhook():
                 silent=True
             )
 
-            if isinstance(data, dict):
+            if isinstance(
+                data,
+                dict,
+            ):
                 text = (
                     data.get("message")
                     or data.get("text")
