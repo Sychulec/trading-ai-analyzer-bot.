@@ -4,7 +4,6 @@ import urllib.parse
 import urllib.request
 import json
 import asyncio
-import re
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -16,6 +15,11 @@ from telegram.ext import (
     filters,
 )
 
+
+# =========================================================
+# LOGOWANIE
+# =========================================================
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -23,18 +27,31 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+# =========================================================
+# ENVIRONMENT VARIABLES
+# =========================================================
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Brak TELEGRAM_TOKEN w Render.")
+    raise RuntimeError(
+        "Brak TELEGRAM_TOKEN w Render."
+    )
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("Brak OPENAI_API_KEY w Render.")
+    raise RuntimeError(
+        "Brak OPENAI_API_KEY w Render."
+    )
 
 if not TWELVE_DATA_API_KEY:
-    raise RuntimeError("Brak TWELVE_DATA_API_KEY w Render.")
+    raise RuntimeError(
+        "Brak TWELVE_DATA_API_KEY w Render."
+    )
+
 
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY
@@ -42,7 +59,7 @@ client = AsyncOpenAI(
 
 
 # =========================================================
-# INSTRUMENTY
+# OBSŁUGIWANE INSTRUMENTY
 # =========================================================
 
 SYMBOLS = {
@@ -56,23 +73,127 @@ SYMBOLS = {
         "name": "EURUSD",
     },
 
-    # US100 ustawimy po potwierdzeniu symbolu
-    # dostępnego na Twoim planie Twelve Data.
+    # US100 dodamy po znalezieniu
+    # prawidłowego symbolu Twelve Data.
 }
 
 
 def detect_symbol(text):
-    upper = text.upper().replace("/", "")
+    cleaned = (
+        text.upper()
+        .replace("/", "")
+        .replace(" ", "")
+    )
 
     for alias in SYMBOLS:
-        if alias in upper:
+        if alias in cleaned:
             return alias
 
     return None
 
 
 # =========================================================
-# TWELVE DATA
+# WYSZUKIWANIE SYMBOLI TWELVE DATA
+# =========================================================
+
+def search_twelve_data_symbol(query):
+    params = urllib.parse.urlencode(
+        {
+            "symbol": query,
+            "apikey": TWELVE_DATA_API_KEY,
+        }
+    )
+
+    url = (
+        "https://api.twelvedata.com/"
+        f"symbol_search?{params}"
+    )
+
+    try:
+        with urllib.request.urlopen(
+            url,
+            timeout=15,
+        ) as response:
+            data = json.loads(
+                response.read().decode(
+                    "utf-8"
+                )
+            )
+
+        results = data.get(
+            "data",
+            []
+        )
+
+        if not results:
+            return (
+                "Brak wyników dla tego wyszukiwania."
+            )
+
+        lines = []
+
+        for item in results[:10]:
+            symbol = item.get(
+                "symbol",
+                "?"
+            )
+
+            instrument_name = (
+                item.get("instrument_name")
+                or item.get("name")
+                or "?"
+            )
+
+            instrument_type = (
+                item.get("instrument_type")
+                or item.get("type")
+                or "?"
+            )
+
+            exchange = item.get(
+                "exchange",
+                "?"
+            )
+
+            country = item.get(
+                "country",
+                "?"
+            )
+
+            currency = item.get(
+                "currency",
+                "?"
+            )
+
+            lines.append(
+                f"Symbol: {symbol}\n"
+                f"Nazwa: {instrument_name}\n"
+                f"Typ: {instrument_type}\n"
+                f"Giełda: {exchange}\n"
+                f"Kraj: {country}\n"
+                f"Waluta: {currency}"
+            )
+
+        return (
+            "\n\n----------------\n\n"
+        ).join(
+            lines
+        )
+
+    except Exception as error:
+        logger.exception(
+            "Błąd symbol_search: %s",
+            error,
+        )
+
+        return (
+            "Błąd podczas wyszukiwania "
+            f"symbolu: {error}"
+        )
+
+
+# =========================================================
+# TWELVE DATA - ŚWIECE
 # =========================================================
 
 def fetch_candles(
@@ -116,6 +237,7 @@ def fetch_candles(
                 interval,
                 data,
             )
+
             return None
 
         candles = []
@@ -125,11 +247,21 @@ def fetch_candles(
         ):
             candles.append(
                 {
-                    "datetime": item["datetime"],
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
+                    "datetime": item[
+                        "datetime"
+                    ],
+                    "open": float(
+                        item["open"]
+                    ),
+                    "high": float(
+                        item["high"]
+                    ),
+                    "low": float(
+                        item["low"]
+                    ),
+                    "close": float(
+                        item["close"]
+                    ),
                 }
             )
 
@@ -142,19 +274,23 @@ def fetch_candles(
             interval,
             error,
         )
+
         return None
 
 
 # =========================================================
-# WSKAŹNIKI
+# EMA
 # =========================================================
 
-def ema_series(values, period):
+def ema_series(
+    values,
+    period,
+):
     if not values:
         return []
 
-    multiplier = 2 / (
-        period + 1
+    multiplier = (
+        2 / (period + 1)
     )
 
     result = [
@@ -174,6 +310,10 @@ def ema_series(values, period):
 
     return result
 
+
+# =========================================================
+# RSI
+# =========================================================
 
 def calculate_rsi(
     closes,
@@ -203,12 +343,16 @@ def calculate_rsi(
         )
 
     avg_gain = (
-        sum(gains[:period])
+        sum(
+            gains[:period]
+        )
         / period
     )
 
     avg_loss = (
-        sum(losses[:period])
+        sum(
+            losses[:period]
+        )
         / period
     )
 
@@ -249,7 +393,13 @@ def calculate_rsi(
     )
 
 
-def calculate_macd(closes):
+# =========================================================
+# MACD
+# =========================================================
+
+def calculate_macd(
+    closes,
+):
     if len(closes) < 35:
         return (
             None,
@@ -280,8 +430,14 @@ def calculate_macd(closes):
         9,
     )
 
-    macd = macd_line[-1]
-    signal = signal_line[-1]
+    macd = (
+        macd_line[-1]
+    )
+
+    signal = (
+        signal_line[-1]
+    )
+
     histogram = (
         macd - signal
     )
@@ -292,6 +448,10 @@ def calculate_macd(closes):
         histogram,
     )
 
+
+# =========================================================
+# WSPARCIE / OPÓR
+# =========================================================
 
 def calculate_support_resistance(
     candles,
@@ -352,7 +512,9 @@ def analyze_timeframe(
         for candle in candles
     ]
 
-    latest = candles[-1]
+    latest = (
+        candles[-1]
+    )
 
     ema20_values = ema_series(
         closes,
@@ -364,8 +526,13 @@ def analyze_timeframe(
         50,
     )
 
-    ema20 = ema20_values[-1]
-    ema50 = ema50_values[-1]
+    ema20 = (
+        ema20_values[-1]
+    )
+
+    ema50 = (
+        ema50_values[-1]
+    )
 
     rsi = calculate_rsi(
         closes
@@ -397,11 +564,21 @@ def analyze_timeframe(
 
     return {
         "interval": interval,
-        "datetime": latest["datetime"],
-        "price": latest["close"],
-        "open": latest["open"],
-        "high": latest["high"],
-        "low": latest["low"],
+        "datetime": latest[
+            "datetime"
+        ],
+        "price": latest[
+            "close"
+        ],
+        "open": latest[
+            "open"
+        ],
+        "high": latest[
+            "high"
+        ],
+        "low": latest[
+            "low"
+        ],
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
@@ -413,6 +590,10 @@ def analyze_timeframe(
         "trend": trend,
     }
 
+
+# =========================================================
+# ANALIZA WIELU INTERWAŁÓW
+# =========================================================
 
 def build_market_analysis(
     symbol="XAUUSD",
@@ -437,55 +618,87 @@ def build_market_analysis(
     return results
 
 
-def format_market_data(results):
+# =========================================================
+# FORMAT DANYCH DLA AI
+# =========================================================
+
+def format_market_data(
+    results,
+):
     parts = []
 
     for data in results:
-        interval = data[
-            "interval"
-        ]
+        interval = (
+            data["interval"]
+        )
 
         if "error" in data:
             parts.append(
                 f"{interval}: "
                 f"{data['error']}"
             )
+
             continue
 
         parts.append(
             f"""
 INTERWAŁ {interval}
-Czas: {data['datetime']}
-Cena: {data['price']:.2f}
-Open: {data['open']:.2f}
-High: {data['high']:.2f}
-Low: {data['low']:.2f}
 
-Trend EMA: {data['trend']}
-EMA20: {data['ema20']:.2f}
-EMA50: {data['ema50']:.2f}
+Czas:
+{data['datetime']}
 
-RSI: {data['rsi']:.2f}
+Cena:
+{data['price']:.4f}
 
-MACD: {data['macd']:.4f}
-Signal: {data['signal']:.4f}
-Histogram: {data['histogram']:.4f}
+Open:
+{data['open']:.4f}
+
+High:
+{data['high']:.4f}
+
+Low:
+{data['low']:.4f}
+
+Trend EMA:
+{data['trend']}
+
+EMA20:
+{data['ema20']:.4f}
+
+EMA50:
+{data['ema50']:.4f}
+
+RSI:
+{data['rsi']:.2f}
+
+MACD:
+{data['macd']:.4f}
+
+Signal:
+{data['signal']:.4f}
+
+Histogram:
+{data['histogram']:.4f}
 
 Wsparcie:
-{data['support']:.2f}
+{data['support']:.4f}
 
 Opór:
-{data['resistance']:.2f}
+{data['resistance']:.4f}
 """.strip()
         )
 
     return (
-        "\n\n----------------\n\n"
-    ).join(parts)
+        "\n\n"
+        "----------------"
+        "\n\n"
+    ).join(
+        parts
+    )
 
 
 # =========================================================
-# TELEGRAM
+# /START
 # =========================================================
 
 async def start(
@@ -498,13 +711,23 @@ async def start(
     await update.message.reply_text(
         "Cześć! 👋\n\n"
         "Jestem Trading AI Analyzer.\n\n"
-        "Możesz napisać np.:\n"
+        "Możesz napisać:\n\n"
         "XAUUSD\n"
-        "Analizuj XAUUSD\n"
         "EURUSD\n\n"
-        "Sprawdzę 1m, 5m, 15m i 1h."
+        "albo np.:\n\n"
+        "Analizuj XAUUSD\n"
+        "Analizuj EURUSD\n\n"
+        "Możesz też wyszukać instrument:\n\n"
+        "SZUKAJ US100\n"
+        "SZUKAJ NDX\n"
+        "SZUKAJ Nasdaq 100\n\n"
+        "Analizuję 1m, 5m, 15m i 1h."
     )
 
+
+# =========================================================
+# /ID
+# =========================================================
 
 async def show_id(
     update: Update,
@@ -522,6 +745,10 @@ async def show_id(
     )
 
 
+# =========================================================
+# WIADOMOŚCI
+# =========================================================
+
 async def answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -532,7 +759,51 @@ async def answer(
     ):
         return
 
-    text = update.message.text
+    text = (
+        update.message.text.strip()
+    )
+
+
+    # =====================================================
+    # WYSZUKIWANIE SYMBOLU
+    # =====================================================
+
+    if text.upper().startswith(
+        "SZUKAJ "
+    ):
+        query = (
+            text[7:].strip()
+        )
+
+        if not query:
+            await update.message.reply_text(
+                "Podaj nazwę instrumentu.\n"
+                "Np. SZUKAJ US100"
+            )
+            return
+
+        await update.message.chat.send_action(
+            action="typing"
+        )
+
+        result = (
+            await asyncio.to_thread(
+                search_twelve_data_symbol,
+                query,
+            )
+        )
+
+        await update.message.reply_text(
+            f"🔎 Wyniki dla: {query}\n\n"
+            f"{result}"
+        )
+
+        return
+
+
+    # =====================================================
+    # NORMALNA ANALIZA
+    # =====================================================
 
     symbol = detect_symbol(
         text
@@ -540,12 +811,15 @@ async def answer(
 
     if not symbol:
         await update.message.reply_text(
-            "Podaj instrument.\n\n"
-            "Na razie obsługuję:\n"
+            "Nie rozpoznaję instrumentu.\n\n"
+            "Aktualnie analizuję:\n"
             "XAUUSD\n"
             "EURUSD\n\n"
-            "US100 dodamy w następnym kroku."
+            "Jeżeli chcesz znaleźć nowy symbol, "
+            "napisz np.:\n\n"
+            "SZUKAJ US100"
         )
+
         return
 
     try:
@@ -560,85 +834,114 @@ async def answer(
             )
         )
 
-        market_data = format_market_data(
-            market_results
+        market_data = (
+            format_market_data(
+                market_results
+            )
         )
 
         prompt = f"""
 INSTRUMENT:
 {symbol}
 
-PYTANIE:
+PYTANIE UŻYTKOWNIKA:
 {text}
 
-AKTUALNE DANE:
+AKTUALNE DANE RYNKOWE:
+
 {market_data}
 
-Przeanalizuj rynek i zaproponuj
-krótki plan transakcyjny.
+Przeanalizuj aktualny rynek.
+
+H1 traktuj jako główny kierunek.
+
+15m służy do oceny struktury.
+
+5m służy do oceny momentum.
+
+1m służy do znalezienia timingu wejścia.
+
+Jeżeli nie ma sensownego wejścia,
+nie wymuszaj transakcji.
 """
 
         response = (
             await client.responses.create(
                 model="gpt-5-mini",
+
                 instructions=(
                     "Odpowiadaj po polsku. "
+
+                    "Jesteś Trading AI Analyzer. "
 
                     "Analizuj instrument na "
                     "1m, 5m, 15m i 1h. "
 
                     "H1 traktuj jako główny kierunek. "
-                    "15m jako strukturę. "
+                    "15m jako strukturę rynku. "
                     "5m jako momentum. "
                     "1m jako timing wejścia. "
 
-                    "Uwzględnij EMA20, EMA50, "
-                    "RSI, MACD, wsparcie i opór. "
+                    "Uwzględnij EMA20, EMA50, RSI, "
+                    "MACD, histogram MACD, "
+                    "wsparcie i opór. "
 
-                    "Masz wybrać jedną decyzję: "
+                    "Wybierz jedną decyzję: "
                     "LONG, SHORT albo CZEKAJ. "
 
                     "Jeżeli warunki są dobre, "
-                    "zaproponuj własną cenę albo "
-                    "wąską strefę wejścia, SL, "
-                    "TP1, TP2 i TP3. "
+                    "podaj własną cenę lub "
+                    "wąską strefę wejścia, "
+                    "SL, TP1, TP2 i TP3. "
 
-                    "Jeżeli setup jest słaby, "
-                    "napisz CZEKAJ zamiast "
-                    "wymyślać wejście. "
+                    "Jeżeli rynek nie daje "
+                    "dobrego setupu, napisz CZEKAJ. "
 
-                    "Odpowiedź ma być krótka. "
+                    "Nie wymyślaj poziomów "
+                    "tylko po to, żeby podać transakcję. "
 
-                    "Format:\n\n"
+                    "Odpowiedź ma być krótka "
+                    "i czytelna na telefonie. "
+
+                    "Użyj formatu:\n\n"
 
                     "📊 [INSTRUMENT]\n"
-                    "Cena teraz: ...\n"
-                    "Decyzja: 🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
+                    "Cena teraz: [cena]\n"
+                    "Decyzja: "
+                    "🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
 
-                    "Wejście AI: ...\n"
-                    "SL: ...\n"
-                    "TP1: ...\n"
-                    "TP2: ...\n"
-                    "TP3: ...\n\n"
+                    "Wejście AI: [cena/strefa lub -]\n"
+                    "SL: [cena lub -]\n"
+                    "TP1: [cena lub -]\n"
+                    "TP2: [cena lub -]\n"
+                    "TP3: [cena lub -]\n\n"
 
                     "1m: ✅/⚠️/❌\n"
                     "5m: ✅/⚠️/❌\n"
                     "15m: ✅/⚠️/❌\n"
                     "1h: ✅/⚠️/❌\n\n"
 
-                    "Warunek wejścia: jedno zdanie.\n"
-                    "Unieważnienie: jedno zdanie.\n\n"
+                    "Warunek wejścia: "
+                    "jedno krótkie zdanie.\n"
+
+                    "Unieważnienie: "
+                    "jedno krótkie zdanie.\n\n"
 
                     "Nie gwarantuj zysku. "
-                    "Nie wymyślaj danych."
+                    "Nie przedstawiaj wyniku "
+                    "jako pewnej transakcji."
                 ),
+
                 input=prompt,
             )
         )
 
         answer_text = (
             response.output_text
-            or "AI nie zwróciło odpowiedzi."
+            or (
+                "AI nie zwróciło "
+                "odpowiedzi."
+            )
         )
 
         for i in range(
@@ -664,6 +967,10 @@ krótki plan transakcyjny.
         )
 
 
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -673,6 +980,10 @@ async def error_handler(
         exc_info=context.error,
     )
 
+
+# =========================================================
+# START BOTA
+# =========================================================
 
 def main():
     logger.info(
