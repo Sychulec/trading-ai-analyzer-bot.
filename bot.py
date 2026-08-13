@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+STOCKDIO_API_KEY = os.getenv("STOCKDIO_API_KEY")
 
 
 if not TELEGRAM_TOKEN:
@@ -53,7 +54,7 @@ client = AsyncOpenAI(
 
 
 # =========================================================
-# OBSŁUGIWANE INSTRUMENTY
+# INSTRUMENTY
 # =========================================================
 
 SYMBOLS = {
@@ -84,175 +85,35 @@ def detect_symbol(text):
 
 
 # =========================================================
-# WYSZUKIWANIE SYMBOLI TWELVE DATA
+# STOCKDIO - TEST KLUCZA
 # =========================================================
 
-def search_twelve_data_symbol(query):
-    params = urllib.parse.urlencode(
-        {
-            "symbol": query,
-            "apikey": TWELVE_DATA_API_KEY,
-        }
-    )
-
-    url = (
-        "https://api.twelvedata.com/"
-        f"symbol_search?{params}"
-    )
-
-    try:
-        with urllib.request.urlopen(
-            url,
-            timeout=15,
-        ) as response:
-            data = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        results = data.get(
-            "data",
-            []
-        )
-
-        if not results:
-            return "Brak wyników."
-
-        lines = []
-
-        for item in results[:10]:
-            symbol = item.get(
-                "symbol",
-                "?"
-            )
-
-            instrument_name = (
-                item.get("instrument_name")
-                or item.get("name")
-                or "?"
-            )
-
-            instrument_type = (
-                item.get("instrument_type")
-                or item.get("type")
-                or "?"
-            )
-
-            exchange = item.get(
-                "exchange",
-                "?"
-            )
-
-            country = item.get(
-                "country",
-                "?"
-            )
-
-            currency = item.get(
-                "currency",
-                "?"
-            )
-
-            lines.append(
-                f"Symbol: {symbol}\n"
-                f"Nazwa: {instrument_name}\n"
-                f"Typ: {instrument_type}\n"
-                f"Giełda: {exchange}\n"
-                f"Kraj: {country}\n"
-                f"Waluta: {currency}"
-            )
-
+def stockdio_key_status():
+    if not STOCKDIO_API_KEY:
         return (
-            "\n\n----------------\n\n"
-        ).join(lines)
-
-    except Exception as error:
-        logger.exception(
-            "Błąd symbol_search: %s",
-            error,
+            "❌ Brak STOCKDIO_API_KEY w Render.\n\n"
+            "Wejdź w Render → Environment "
+            "i dodaj zmienną STOCKDIO_API_KEY."
         )
 
-        return (
-            f"Błąd wyszukiwania: {error}"
-        )
-
-
-# =========================================================
-# TEST US100 / NASDAQ-100
-# =========================================================
-
-def test_us100_candidates():
-    candidates = [
-        "NDX",
-        "NASDAQ100",
-        "NASDAQ-100",
-        "NQX",
-        "US100",
-    ]
-
-    results = []
-
-    for symbol in candidates:
-        params = urllib.parse.urlencode(
-            {
-                "symbol": symbol,
-                "interval": "1min",
-                "outputsize": 5,
-                "apikey": TWELVE_DATA_API_KEY,
-            }
-        )
-
-        url = (
-            "https://api.twelvedata.com/"
-            f"time_series?{params}"
-        )
-
-        try:
-            with urllib.request.urlopen(
-                url,
-                timeout=15,
-            ) as response:
-                data = json.loads(
-                    response.read().decode("utf-8")
-                )
-
-            if (
-                "values" in data
-                and data["values"]
-            ):
-                latest = data[
-                    "values"
-                ][0]
-
-                results.append(
-                    f"✅ {symbol}\n"
-                    f"Cena: {latest.get('close')}\n"
-                    f"Czas: {latest.get('datetime')}"
-                )
-
-            else:
-                message = data.get(
-                    "message",
-                    "brak danych",
-                )
-
-                results.append(
-                    f"❌ {symbol}\n"
-                    f"{message}"
-                )
-
-        except Exception as error:
-            results.append(
-                f"❌ {symbol}\n"
-                f"Błąd: {error}"
-            )
+    masked = (
+        STOCKDIO_API_KEY[:4]
+        + "..."
+        + STOCKDIO_API_KEY[-4:]
+        if len(STOCKDIO_API_KEY) >= 8
+        else "ustawiony"
+    )
 
     return (
-        "\n\n----------------\n\n"
-    ).join(results)
+        "✅ STOCKDIO_API_KEY jest dostępny w Render.\n"
+        f"Klucz: {masked}\n\n"
+        "Następny krok: skopiujemy dokładny "
+        "endpoint Stockdio z panelu Services."
+    )
 
 
 # =========================================================
-# TWELVE DATA - ŚWIECE
+# TWELVE DATA
 # =========================================================
 
 def fetch_candles(
@@ -294,7 +155,6 @@ def fetch_candles(
                 interval,
                 data,
             )
-
             return None
 
         candles = []
@@ -304,21 +164,11 @@ def fetch_candles(
         ):
             candles.append(
                 {
-                    "datetime": item[
-                        "datetime"
-                    ],
-                    "open": float(
-                        item["open"]
-                    ),
-                    "high": float(
-                        item["high"]
-                    ),
-                    "low": float(
-                        item["low"]
-                    ),
-                    "close": float(
-                        item["close"]
-                    ),
+                    "datetime": item["datetime"],
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
                 }
             )
 
@@ -331,7 +181,6 @@ def fetch_candles(
             interval,
             error,
         )
-
         return None
 
 
@@ -339,31 +188,21 @@ def fetch_candles(
 # EMA
 # =========================================================
 
-def ema_series(
-    values,
-    period,
-):
+def ema_series(values, period):
     if not values:
         return []
 
-    multiplier = (
-        2 / (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
-    result = [
-        values[0]
-    ]
+    result = [values[0]]
 
     for value in values[1:]:
         new_ema = (
             value * multiplier
-            + result[-1]
-            * (1 - multiplier)
+            + result[-1] * (1 - multiplier)
         )
 
-        result.append(
-            new_ema
-        )
+        result.append(new_ema)
 
     return result
 
@@ -372,107 +211,51 @@ def ema_series(
 # RSI
 # =========================================================
 
-def calculate_rsi(
-    closes,
-    period=14,
-):
+def calculate_rsi(closes, period=14):
     if len(closes) <= period:
         return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(closes),
-    ):
-        change = (
-            closes[i]
-            - closes[i - 1]
-        )
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
 
-        gains.append(
-            max(change, 0)
-        )
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-        losses.append(
-            max(-change, 0)
-        )
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    avg_gain = (
-        sum(
-            gains[:period]
-        )
-        / period
-    )
-
-    avg_loss = (
-        sum(
-            losses[:period]
-        )
-        / period
-    )
-
-    for i in range(
-        period,
-        len(gains),
-    ):
+    for i in range(period, len(gains)):
         avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
+            avg_gain * (period - 1)
             + gains[i]
         ) / period
 
         avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
+            avg_loss * (period - 1)
             + losses[i]
         ) / period
 
     if avg_loss == 0:
         return 100.0
 
-    rs = (
-        avg_gain
-        / avg_loss
-    )
+    rs = avg_gain / avg_loss
 
-    return (
-        100
-        - (
-            100
-            / (1 + rs)
-        )
-    )
+    return 100 - (100 / (1 + rs))
 
 
 # =========================================================
 # MACD
 # =========================================================
 
-def calculate_macd(
-    closes,
-):
+def calculate_macd(closes):
     if len(closes) < 35:
-        return (
-            None,
-            None,
-            None,
-        )
+        return None, None, None
 
-    ema12 = ema_series(
-        closes,
-        12,
-    )
-
-    ema26 = ema_series(
-        closes,
-        26,
-    )
+    ema12 = ema_series(closes, 12)
+    ema26 = ema_series(closes, 26)
 
     macd_line = [
         a - b
@@ -487,17 +270,9 @@ def calculate_macd(
         9,
     )
 
-    macd = (
-        macd_line[-1]
-    )
-
-    signal = (
-        signal_line[-1]
-    )
-
-    histogram = (
-        macd - signal
-    )
+    macd = macd_line[-1]
+    signal = signal_line[-1]
+    histogram = macd - signal
 
     return (
         macd,
@@ -515,14 +290,9 @@ def calculate_support_resistance(
     lookback=30,
 ):
     if not candles:
-        return (
-            None,
-            None,
-        )
+        return None, None
 
-    recent = (
-        candles[-lookback:]
-    )
+    recent = candles[-lookback:]
 
     support = min(
         candle["low"]
@@ -559,9 +329,7 @@ def analyze_timeframe(
     ):
         return {
             "interval": interval,
-            "error": (
-                "Brak wystarczających danych"
-            ),
+            "error": "Brak wystarczających danych",
         }
 
     closes = [
@@ -569,39 +337,25 @@ def analyze_timeframe(
         for candle in candles
     ]
 
-    latest = (
-        candles[-1]
-    )
+    latest = candles[-1]
 
-    ema20_values = ema_series(
+    ema20 = ema_series(
         closes,
         20,
-    )
+    )[-1]
 
-    ema50_values = ema_series(
+    ema50 = ema_series(
         closes,
         50,
-    )
+    )[-1]
 
-    ema20 = (
-        ema20_values[-1]
-    )
-
-    ema50 = (
-        ema50_values[-1]
-    )
-
-    rsi = calculate_rsi(
-        closes
-    )
+    rsi = calculate_rsi(closes)
 
     (
         macd,
         signal,
         histogram,
-    ) = calculate_macd(
-        closes
-    )
+    ) = calculate_macd(closes)
 
     (
         support,
@@ -612,30 +366,18 @@ def analyze_timeframe(
 
     if ema20 > ema50:
         trend = "wzrostowy"
-
     elif ema20 < ema50:
         trend = "spadkowy"
-
     else:
         trend = "neutralny"
 
     return {
         "interval": interval,
-        "datetime": latest[
-            "datetime"
-        ],
-        "price": latest[
-            "close"
-        ],
-        "open": latest[
-            "open"
-        ],
-        "high": latest[
-            "high"
-        ],
-        "low": latest[
-            "low"
-        ],
+        "datetime": latest["datetime"],
+        "price": latest["close"],
+        "open": latest["open"],
+        "high": latest["high"],
+        "low": latest["low"],
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
@@ -676,79 +418,49 @@ def build_market_analysis(
 
 
 # =========================================================
-# FORMAT DANYCH DLA AI
+# FORMAT DANYCH
 # =========================================================
 
-def format_market_data(
-    results,
-):
+def format_market_data(results):
     parts = []
 
     for data in results:
-        interval = (
-            data["interval"]
-        )
+        interval = data["interval"]
 
         if "error" in data:
             parts.append(
-                f"{interval}: "
-                f"{data['error']}"
+                f"{interval}: {data['error']}"
             )
-
             continue
 
         parts.append(
             f"""
 INTERWAŁ {interval}
 
-Czas:
-{data['datetime']}
+Czas: {data['datetime']}
+Cena: {data['price']:.4f}
 
-Cena:
-{data['price']:.4f}
+Open: {data['open']:.4f}
+High: {data['high']:.4f}
+Low: {data['low']:.4f}
 
-Open:
-{data['open']:.4f}
+Trend EMA: {data['trend']}
+EMA20: {data['ema20']:.4f}
+EMA50: {data['ema50']:.4f}
 
-High:
-{data['high']:.4f}
+RSI: {data['rsi']:.2f}
 
-Low:
-{data['low']:.4f}
+MACD: {data['macd']:.4f}
+Signal: {data['signal']:.4f}
+Histogram: {data['histogram']:.4f}
 
-Trend EMA:
-{data['trend']}
-
-EMA20:
-{data['ema20']:.4f}
-
-EMA50:
-{data['ema50']:.4f}
-
-RSI:
-{data['rsi']:.2f}
-
-MACD:
-{data['macd']:.4f}
-
-Signal:
-{data['signal']:.4f}
-
-Histogram:
-{data['histogram']:.4f}
-
-Wsparcie:
-{data['support']:.4f}
-
-Opór:
-{data['resistance']:.4f}
+Wsparcie: {data['support']:.4f}
+Opór: {data['resistance']:.4f}
 """.strip()
         )
 
     return (
-        "\n\n"
-        "----------------"
-        "\n\n"
+        "\n\n----------------\n\n"
     ).join(parts)
 
 
@@ -765,16 +477,12 @@ async def start(
 
     await update.message.reply_text(
         "Cześć! 👋\n\n"
-        "Jestem Trading AI Analyzer.\n\n"
+        "Trading AI Analyzer\n\n"
         "Analiza:\n"
         "XAUUSD\n"
         "EURUSD\n\n"
-        "Wyszukiwanie:\n"
-        "SZUKAJ US100\n"
-        "SZUKAJ NDX\n"
-        "SZUKAJ Nasdaq 100\n\n"
-        "Test Nasdaq/US100:\n"
-        "TEST US100\n\n"
+        "Test Stockdio:\n"
+        "TEST STOCKDIO\n\n"
         "Analizuję 1m, 5m, 15m i 1h."
     )
 
@@ -813,28 +521,21 @@ async def answer(
     ):
         return
 
-    text = (
-        update.message.text.strip()
-    )
+    text = update.message.text.strip()
 
 
     # =====================================================
-    # TEST US100
+    # STOCKDIO TEST
     # =====================================================
 
-    if text.upper() == "TEST US100":
-        await update.message.chat.send_action(
-            action="typing"
-        )
-
-        result = (
-            await asyncio.to_thread(
-                test_us100_candidates
-            )
-        )
+    if text.upper() in (
+        "TEST STOCKDIO",
+        "TEST STOCKDIO US100",
+    ):
+        result = stockdio_key_status()
 
         await update.message.reply_text(
-            "🧪 TEST US100 / NASDAQ-100\n\n"
+            "🧪 TEST STOCKDIO\n\n"
             + result
         )
 
@@ -842,50 +543,10 @@ async def answer(
 
 
     # =====================================================
-    # WYSZUKIWANIE SYMBOLU
+    # ANALIZA
     # =====================================================
 
-    if text.upper().startswith(
-        "SZUKAJ "
-    ):
-        query = (
-            text[7:].strip()
-        )
-
-        if not query:
-            await update.message.reply_text(
-                "Podaj nazwę instrumentu.\n"
-                "Np. SZUKAJ US100"
-            )
-
-            return
-
-        await update.message.chat.send_action(
-            action="typing"
-        )
-
-        result = (
-            await asyncio.to_thread(
-                search_twelve_data_symbol,
-                query,
-            )
-        )
-
-        await update.message.reply_text(
-            f"🔎 Wyniki dla: {query}\n\n"
-            f"{result}"
-        )
-
-        return
-
-
-    # =====================================================
-    # NORMALNA ANALIZA
-    # =====================================================
-
-    symbol = detect_symbol(
-        text
-    )
+    symbol = detect_symbol(text)
 
     if not symbol:
         await update.message.reply_text(
@@ -893,10 +554,9 @@ async def answer(
             "Aktualnie analizuję:\n"
             "XAUUSD\n"
             "EURUSD\n\n"
-            "Do testu US100 wpisz:\n"
-            "TEST US100"
+            "Test Stockdio:\n"
+            "TEST STOCKDIO"
         )
-
         return
 
     try:
@@ -911,31 +571,29 @@ async def answer(
             )
         )
 
-        market_data = (
-            format_market_data(
-                market_results
-            )
+        market_data = format_market_data(
+            market_results
         )
 
         prompt = f"""
 INSTRUMENT:
 {symbol}
 
-PYTANIE UŻYTKOWNIKA:
+PYTANIE:
 {text}
 
-AKTUALNE DANE RYNKOWE:
+AKTUALNE DANE:
 
 {market_data}
 
 Przeanalizuj aktualny rynek.
 
-H1 traktuj jako główny kierunek.
-15m służy do oceny struktury.
-5m służy do oceny momentum.
-1m służy do znalezienia timingu wejścia.
+H1 = główny kierunek.
+15m = struktura.
+5m = momentum.
+1m = timing.
 
-Jeżeli nie ma sensownego wejścia,
+Jeśli nie ma dobrego wejścia,
 nie wymuszaj transakcji.
 """
 
@@ -946,64 +604,40 @@ nie wymuszaj transakcji.
                 instructions=(
                     "Odpowiadaj po polsku. "
 
-                    "Jesteś Trading AI Analyzer. "
-
-                    "Analizuj instrument na "
-                    "1m, 5m, 15m i 1h. "
-
-                    "H1 traktuj jako główny kierunek. "
-                    "15m jako strukturę rynku. "
-                    "5m jako momentum. "
-                    "1m jako timing wejścia. "
+                    "Analizuj 1m, 5m, 15m i 1h. "
 
                     "Uwzględnij EMA20, EMA50, RSI, "
-                    "MACD, histogram MACD, "
-                    "wsparcie i opór. "
+                    "MACD, wsparcie i opór. "
 
-                    "Wybierz jedną decyzję: "
-                    "LONG, SHORT albo CZEKAJ. "
+                    "Wybierz LONG, SHORT albo CZEKAJ. "
 
-                    "Jeżeli warunki są dobre, "
-                    "podaj własną cenę lub "
-                    "wąską strefę wejścia, "
-                    "SL, TP1, TP2 i TP3. "
+                    "Jeżeli setup jest dobry, "
+                    "podaj wejście AI, SL, TP1, TP2 i TP3. "
 
-                    "Jeżeli rynek nie daje "
-                    "dobrego setupu, napisz CZEKAJ. "
+                    "Jeżeli setup jest słaby, "
+                    "napisz CZEKAJ i nie wymyślaj poziomów. "
 
-                    "Nie wymyślaj poziomów "
-                    "tylko po to, żeby podać transakcję. "
-
-                    "Odpowiedź ma być krótka "
-                    "i czytelna na telefonie. "
-
-                    "Użyj formatu:\n\n"
+                    "Format:\n\n"
 
                     "📊 [INSTRUMENT]\n"
-                    "Cena teraz: [cena]\n"
-                    "Decyzja: "
-                    "🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
+                    "Cena teraz: ...\n"
+                    "Decyzja: 🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
 
-                    "Wejście AI: [cena/strefa lub -]\n"
-                    "SL: [cena lub -]\n"
-                    "TP1: [cena lub -]\n"
-                    "TP2: [cena lub -]\n"
-                    "TP3: [cena lub -]\n\n"
+                    "Wejście AI: ...\n"
+                    "SL: ...\n"
+                    "TP1: ...\n"
+                    "TP2: ...\n"
+                    "TP3: ...\n\n"
 
                     "1m: ✅/⚠️/❌\n"
                     "5m: ✅/⚠️/❌\n"
                     "15m: ✅/⚠️/❌\n"
                     "1h: ✅/⚠️/❌\n\n"
 
-                    "Warunek wejścia: "
-                    "jedno krótkie zdanie.\n"
+                    "Warunek wejścia: jedno zdanie.\n"
+                    "Unieważnienie: jedno zdanie.\n\n"
 
-                    "Unieważnienie: "
-                    "jedno krótkie zdanie.\n\n"
-
-                    "Nie gwarantuj zysku. "
-                    "Nie przedstawiaj wyniku "
-                    "jako pewnej transakcji."
+                    "Nie gwarantuj zysku."
                 ),
 
                 input=prompt,
@@ -1053,7 +687,7 @@ async def error_handler(
 
 
 # =========================================================
-# START BOTA
+# START
 # =========================================================
 
 def main():
@@ -1095,9 +729,7 @@ def main():
         error_handler
     )
 
-    logger.info(
-        "Bot działa."
-    )
+    logger.info("Bot działa.")
 
     application.run_polling(
         drop_pending_updates=True
