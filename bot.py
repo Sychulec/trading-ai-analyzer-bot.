@@ -4,6 +4,7 @@ import urllib.parse
 import urllib.request
 import json
 import asyncio
+import re
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -26,35 +27,14 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-logger.info(
-    "TELEGRAM_TOKEN dostępny: %s",
-    bool(TELEGRAM_TOKEN),
-)
-
-logger.info(
-    "OPENAI_API_KEY dostępny: %s",
-    bool(OPENAI_API_KEY),
-)
-
-logger.info(
-    "TWELVE_DATA_API_KEY dostępny: %s",
-    bool(TWELVE_DATA_API_KEY),
-)
-
 if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "Brak TELEGRAM_TOKEN w Render."
-    )
+    raise RuntimeError("Brak TELEGRAM_TOKEN w Render.")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "Brak OPENAI_API_KEY w Render."
-    )
+    raise RuntimeError("Brak OPENAI_API_KEY w Render.")
 
 if not TWELVE_DATA_API_KEY:
-    raise RuntimeError(
-        "Brak TWELVE_DATA_API_KEY w Render."
-    )
+    raise RuntimeError("Brak TWELVE_DATA_API_KEY w Render.")
 
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY
@@ -62,16 +42,51 @@ client = AsyncOpenAI(
 
 
 # =========================================================
+# INSTRUMENTY
+# =========================================================
+
+SYMBOLS = {
+    "XAUUSD": {
+        "api_symbol": "XAU/USD",
+        "name": "XAUUSD",
+    },
+
+    "EURUSD": {
+        "api_symbol": "EUR/USD",
+        "name": "EURUSD",
+    },
+
+    # US100 ustawimy po potwierdzeniu symbolu
+    # dostępnego na Twoim planie Twelve Data.
+}
+
+
+def detect_symbol(text):
+    upper = text.upper().replace("/", "")
+
+    for alias in SYMBOLS:
+        if alias in upper:
+            return alias
+
+    return None
+
+
+# =========================================================
 # TWELVE DATA
 # =========================================================
 
 def fetch_candles(
+    symbol,
     interval,
     outputsize=120,
 ):
+    api_symbol = SYMBOLS[
+        symbol
+    ]["api_symbol"]
+
     params = urllib.parse.urlencode(
         {
-            "symbol": "XAU/USD",
+            "symbol": api_symbol,
             "interval": interval,
             "outputsize": outputsize,
             "apikey": TWELVE_DATA_API_KEY,
@@ -79,8 +94,8 @@ def fetch_candles(
     )
 
     url = (
-        "https://api.twelvedata.com/time_series?"
-        f"{params}"
+        "https://api.twelvedata.com/"
+        f"time_series?{params}"
     )
 
     try:
@@ -96,7 +111,8 @@ def fetch_candles(
 
         if "values" not in data:
             logger.error(
-                "Twelve Data %s: %s",
+                "Twelve Data %s %s: %s",
+                symbol,
                 interval,
                 data,
             )
@@ -104,31 +120,16 @@ def fetch_candles(
 
         candles = []
 
-        # Twelve Data zwraca najnowsze
-        # świece jako pierwsze.
-        # Odwracamy kolejność:
-        # najstarsza -> najnowsza.
-
         for item in reversed(
             data["values"]
         ):
             candles.append(
                 {
-                    "datetime": item[
-                        "datetime"
-                    ],
-                    "open": float(
-                        item["open"]
-                    ),
-                    "high": float(
-                        item["high"]
-                    ),
-                    "low": float(
-                        item["low"]
-                    ),
-                    "close": float(
-                        item["close"]
-                    ),
+                    "datetime": item["datetime"],
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
                 }
             )
 
@@ -136,7 +137,8 @@ def fetch_candles(
 
     except Exception as error:
         logger.exception(
-            "Błąd Twelve Data %s: %s",
+            "Błąd Twelve Data %s %s: %s",
+            symbol,
             interval,
             error,
         )
@@ -144,13 +146,10 @@ def fetch_candles(
 
 
 # =========================================================
-# WSKAŹNIKI TECHNICZNE
+# WSKAŹNIKI
 # =========================================================
 
-def ema_series(
-    values,
-    period,
-):
+def ema_series(values, period):
     if not values:
         return []
 
@@ -196,30 +195,20 @@ def calculate_rsi(
         )
 
         gains.append(
-            max(
-                change,
-                0,
-            )
+            max(change, 0)
         )
 
         losses.append(
-            max(
-                -change,
-                0,
-            )
+            max(-change, 0)
         )
 
     avg_gain = (
-        sum(
-            gains[:period]
-        )
+        sum(gains[:period])
         / period
     )
 
     avg_loss = (
-        sum(
-            losses[:period]
-        )
+        sum(losses[:period])
         / period
     )
 
@@ -260,9 +249,7 @@ def calculate_rsi(
     )
 
 
-def calculate_macd(
-    closes,
-):
+def calculate_macd(closes):
     if len(closes) < 35:
         return (
             None,
@@ -288,21 +275,13 @@ def calculate_macd(
         )
     ]
 
-    signal_line = (
-        ema_series(
-            macd_line,
-            9,
-        )
+    signal_line = ema_series(
+        macd_line,
+        9,
     )
 
-    macd = (
-        macd_line[-1]
-    )
-
-    signal = (
-        signal_line[-1]
-    )
-
+    macd = macd_line[-1]
+    signal = signal_line[-1]
     histogram = (
         macd - signal
     )
@@ -344,11 +323,17 @@ def calculate_support_resistance(
     )
 
 
+# =========================================================
+# ANALIZA INTERWAŁU
+# =========================================================
+
 def analyze_timeframe(
+    symbol,
     interval,
 ):
     candles = fetch_candles(
-        interval
+        symbol,
+        interval,
     )
 
     if (
@@ -367,31 +352,20 @@ def analyze_timeframe(
         for candle in candles
     ]
 
-    latest = (
-        candles[-1]
+    latest = candles[-1]
+
+    ema20_values = ema_series(
+        closes,
+        20,
     )
 
-    ema20_values = (
-        ema_series(
-            closes,
-            20,
-        )
+    ema50_values = ema_series(
+        closes,
+        50,
     )
 
-    ema50_values = (
-        ema_series(
-            closes,
-            50,
-        )
-    )
-
-    ema20 = (
-        ema20_values[-1]
-    )
-
-    ema50 = (
-        ema50_values[-1]
-    )
+    ema20 = ema20_values[-1]
+    ema50 = ema50_values[-1]
 
     rsi = calculate_rsi(
         closes
@@ -408,10 +382,8 @@ def analyze_timeframe(
     (
         support,
         resistance,
-    ) = (
-        calculate_support_resistance(
-            candles
-        )
+    ) = calculate_support_resistance(
+        candles
     )
 
     if ema20 > ema50:
@@ -425,21 +397,11 @@ def analyze_timeframe(
 
     return {
         "interval": interval,
-        "datetime": latest[
-            "datetime"
-        ],
-        "price": latest[
-            "close"
-        ],
-        "open": latest[
-            "open"
-        ],
-        "high": latest[
-            "high"
-        ],
-        "low": latest[
-            "low"
-        ],
+        "datetime": latest["datetime"],
+        "price": latest["close"],
+        "open": latest["open"],
+        "high": latest["high"],
+        "low": latest["low"],
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
@@ -452,7 +414,9 @@ def analyze_timeframe(
     }
 
 
-def build_market_analysis():
+def build_market_analysis(
+    symbol="XAUUSD",
+):
     intervals = [
         "1min",
         "5min",
@@ -465,65 +429,59 @@ def build_market_analysis():
     for interval in intervals:
         results.append(
             analyze_timeframe(
-                interval
+                symbol,
+                interval,
             )
         )
 
     return results
 
 
-def format_market_data(
-    results,
-):
+def format_market_data(results):
     parts = []
 
     for data in results:
-        interval = (
-            data["interval"]
-        )
+        interval = data[
+            "interval"
+        ]
 
         if "error" in data:
             parts.append(
                 f"{interval}: "
                 f"{data['error']}"
             )
-
             continue
 
         parts.append(
             f"""
 INTERWAŁ {interval}
-Czas świecy: {data['datetime']}
-Cena/close: {data['price']:.2f}
+Czas: {data['datetime']}
+Cena: {data['price']:.2f}
 Open: {data['open']:.2f}
 High: {data['high']:.2f}
 Low: {data['low']:.2f}
 
-Trend EMA20/EMA50: {data['trend']}
+Trend EMA: {data['trend']}
 EMA20: {data['ema20']:.2f}
 EMA50: {data['ema50']:.2f}
 
-RSI(14): {data['rsi']:.2f}
+RSI: {data['rsi']:.2f}
 
 MACD: {data['macd']:.4f}
 Signal: {data['signal']:.4f}
 Histogram: {data['histogram']:.4f}
 
-Orientacyjne wsparcie:
+Wsparcie:
 {data['support']:.2f}
 
-Orientacyjny opór:
+Opór:
 {data['resistance']:.2f}
 """.strip()
         )
 
     return (
-        "\n\n"
-        "----------------"
-        "\n\n"
-    ).join(
-        parts
-    )
+        "\n\n----------------\n\n"
+    ).join(parts)
 
 
 # =========================================================
@@ -539,21 +497,14 @@ async def start(
 
     await update.message.reply_text(
         "Cześć! 👋\n\n"
-        "Jestem Trading AI Analyzer.\n"
-        "Analizuję XAU/USD przy użyciu "
-        "aktualnych danych rynkowych "
-        "z Twelve Data.\n\n"
-        "Uwzględniam interwały:\n"
-        "1m • 5m • 15m • 1h\n\n"
-        "oraz RSI, EMA, MACD "
-        "i orientacyjne poziomy "
-        "wsparcia/oporu."
+        "Jestem Trading AI Analyzer.\n\n"
+        "Możesz napisać np.:\n"
+        "XAUUSD\n"
+        "Analizuj XAUUSD\n"
+        "EURUSD\n\n"
+        "Sprawdzę 1m, 5m, 15m i 1h."
     )
 
-
-# =========================================================
-# KOMENDA /id
-# =========================================================
 
 async def show_id(
     update: Update,
@@ -565,19 +516,11 @@ async def show_id(
     ):
         return
 
-    chat_id = (
-        update.effective_chat.id
-    )
-
     await update.message.reply_text(
         "Twój TELEGRAM_CHAT_ID:\n"
-        f"{chat_id}"
+        f"{update.effective_chat.id}"
     )
 
-
-# =========================================================
-# ANALIZA PYTAŃ UŻYTKOWNIKA
-# =========================================================
 
 async def answer(
     update: Update,
@@ -589,41 +532,50 @@ async def answer(
     ):
         return
 
-    text = (
-        update.message.text
+    text = update.message.text
+
+    symbol = detect_symbol(
+        text
     )
 
-    try:
-        await (
-            update.message.chat
-            .send_action(
-                action="typing"
-            )
+    if not symbol:
+        await update.message.reply_text(
+            "Podaj instrument.\n\n"
+            "Na razie obsługuję:\n"
+            "XAUUSD\n"
+            "EURUSD\n\n"
+            "US100 dodamy w następnym kroku."
         )
+        return
 
-        # Pobieranie danych wykonujemy
-        # poza główną pętlą async Telegrama.
+    try:
+        await update.message.chat.send_action(
+            action="typing"
+        )
 
         market_results = (
             await asyncio.to_thread(
-                build_market_analysis
+                build_market_analysis,
+                symbol,
             )
         )
 
-        market_data = (
-            format_market_data(
-                market_results
-            )
+        market_data = format_market_data(
+            market_results
         )
 
         prompt = f"""
-PYTANIE UŻYTKOWNIKA:
+INSTRUMENT:
+{symbol}
+
+PYTANIE:
 {text}
 
-AKTUALNE DANE TECHNICZNE XAU/USD:
+AKTUALNE DANE:
 {market_data}
 
-Przeanalizuj dane i odpowiedz użytkownikowi.
+Przeanalizuj rynek i zaproponuj
+krótki plan transakcyjny.
 """
 
         response = (
@@ -631,55 +583,54 @@ Przeanalizuj dane i odpowiedz użytkownikowi.
                 model="gpt-5-mini",
                 instructions=(
                     "Odpowiadaj po polsku. "
-                    "Jesteś Trading AI Analyzer. "
 
-                    "Analizujesz XAU/USD "
-                    "na podstawie dostarczonych "
-                    "danych rynkowych. "
-
-                    "Najpierw podaj aktualną "
-                    "cenę widoczną w "
-                    "najświeższych danych. "
-
-                    "Następnie przeanalizuj "
-                    "osobno interwały "
+                    "Analizuj instrument na "
                     "1m, 5m, 15m i 1h. "
 
-                    "Uwzględniaj RSI, "
-                    "EMA20, EMA50, MACD, "
-                    "histogram MACD oraz zakres "
-                    "ostatnich świec. "
+                    "H1 traktuj jako główny kierunek. "
+                    "15m jako strukturę. "
+                    "5m jako momentum. "
+                    "1m jako timing wejścia. "
 
-                    "Oceń, czy sygnały "
-                    "z różnych interwałów "
-                    "są zgodne czy sprzeczne. "
+                    "Uwzględnij EMA20, EMA50, "
+                    "RSI, MACD, wsparcie i opór. "
 
-                    "Wsparcie i opór z programu "
-                    "traktuj jako orientacyjne "
-                    "poziomy wynikające "
-                    "z zakresu ostatnich świec, "
-                    "a nie pewne poziomy "
-                    "techniczne. "
+                    "Masz wybrać jedną decyzję: "
+                    "LONG, SHORT albo CZEKAJ. "
 
-                    "Na końcu przedstaw "
-                    "maksymalnie trzy scenariusze: "
-                    "wzrostowy, spadkowy "
-                    "i neutralny. "
+                    "Jeżeli warunki są dobre, "
+                    "zaproponuj własną cenę albo "
+                    "wąską strefę wejścia, SL, "
+                    "TP1, TP2 i TP3. "
 
-                    "Nie wymyślaj danych. "
-                    "Nie twierdź, że masz dostęp "
-                    "do danych, których "
-                    "nie otrzymałeś. "
+                    "Jeżeli setup jest słaby, "
+                    "napisz CZEKAJ zamiast "
+                    "wymyślać wejście. "
 
-                    "Wyraźnie oddzielaj fakty "
-                    "od interpretacji. "
+                    "Odpowiedź ma być krótka. "
 
-                    "Nie gwarantuj zysków "
-                    "ani kierunku rynku. "
+                    "Format:\n\n"
 
-                    "Nie przedstawiaj analizy "
-                    "jako pewnego sygnału "
-                    "kupna lub sprzedaży."
+                    "📊 [INSTRUMENT]\n"
+                    "Cena teraz: ...\n"
+                    "Decyzja: 🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
+
+                    "Wejście AI: ...\n"
+                    "SL: ...\n"
+                    "TP1: ...\n"
+                    "TP2: ...\n"
+                    "TP3: ...\n\n"
+
+                    "1m: ✅/⚠️/❌\n"
+                    "5m: ✅/⚠️/❌\n"
+                    "15m: ✅/⚠️/❌\n"
+                    "1h: ✅/⚠️/❌\n\n"
+
+                    "Warunek wejścia: jedno zdanie.\n"
+                    "Unieważnienie: jedno zdanie.\n\n"
+
+                    "Nie gwarantuj zysku. "
+                    "Nie wymyślaj danych."
                 ),
                 input=prompt,
             )
@@ -687,27 +638,18 @@ Przeanalizuj dane i odpowiedz użytkownikowi.
 
         answer_text = (
             response.output_text
-            or (
-                "OpenAI nie zwrócił "
-                "odpowiedzi."
-            )
+            or "AI nie zwróciło odpowiedzi."
         )
-
-        # Telegram ma limit
-        # długości wiadomości.
 
         for i in range(
             0,
             len(answer_text),
             4000,
         ):
-            await (
-                update.message
-                .reply_text(
-                    answer_text[
-                        i:i + 4000
-                    ]
-                )
+            await update.message.reply_text(
+                answer_text[
+                    i:i + 4000
+                ]
             )
 
     except Exception as error:
@@ -732,10 +674,6 @@ async def error_handler(
     )
 
 
-# =========================================================
-# START BOTA
-# =========================================================
-
 def main():
     logger.info(
         "Uruchamianie Trading AI Analyzer..."
@@ -749,7 +687,6 @@ def main():
         .build()
     )
 
-    # /start
     application.add_handler(
         CommandHandler(
             "start",
@@ -757,7 +694,6 @@ def main():
         )
     )
 
-    # /id
     application.add_handler(
         CommandHandler(
             "id",
@@ -765,7 +701,6 @@ def main():
         )
     )
 
-    # zwykłe wiadomości
     application.add_handler(
         MessageHandler(
             filters.TEXT
@@ -779,8 +714,7 @@ def main():
     )
 
     logger.info(
-        "Bot działa i oczekuje "
-        "na wiadomości."
+        "Bot działa."
     )
 
     application.run_polling(
