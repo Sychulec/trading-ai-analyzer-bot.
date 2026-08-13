@@ -4,6 +4,7 @@ import urllib.parse
 import urllib.request
 import json
 import asyncio
+from datetime import datetime
 
 from openai import AsyncOpenAI
 from telegram import Update
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# ENVIRONMENT VARIABLES
+# ENV
 # =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -39,13 +40,13 @@ STOCKDIO_API_KEY = os.getenv("STOCKDIO_API_KEY")
 
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Brak TELEGRAM_TOKEN w Render.")
+    raise RuntimeError("Brak TELEGRAM_TOKEN")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("Brak OPENAI_API_KEY w Render.")
+    raise RuntimeError("Brak OPENAI_API_KEY")
 
 if not TWELVE_DATA_API_KEY:
-    raise RuntimeError("Brak TWELVE_DATA_API_KEY w Render.")
+    raise RuntimeError("Brak TWELVE_DATA_API_KEY")
 
 
 client = AsyncOpenAI(
@@ -60,12 +61,9 @@ client = AsyncOpenAI(
 SYMBOLS = {
     "XAUUSD": {
         "api_symbol": "XAU/USD",
-        "name": "XAUUSD",
     },
-
     "EURUSD": {
         "api_symbol": "EUR/USD",
-        "name": "EURUSD",
     },
 }
 
@@ -77,38 +75,25 @@ def detect_symbol(text):
         .replace(" ", "")
     )
 
-    for alias in SYMBOLS:
-        if alias in cleaned:
-            return alias
+    for symbol in SYMBOLS:
+        if symbol in cleaned:
+            return symbol
 
     return None
 
 
 # =========================================================
-# STOCKDIO - TEST KLUCZA
+# STOCKDIO - TYLKO TEST KLUCZA
 # =========================================================
 
 def stockdio_key_status():
     if not STOCKDIO_API_KEY:
         return (
-            "❌ Brak STOCKDIO_API_KEY w Render.\n\n"
-            "Wejdź w Render → Environment "
-            "i dodaj zmienną STOCKDIO_API_KEY."
+            "❌ Brak STOCKDIO_API_KEY w Render."
         )
 
-    masked = (
-        STOCKDIO_API_KEY[:4]
-        + "..."
-        + STOCKDIO_API_KEY[-4:]
-        if len(STOCKDIO_API_KEY) >= 8
-        else "ustawiony"
-    )
-
     return (
-        "✅ STOCKDIO_API_KEY jest dostępny w Render.\n"
-        f"Klucz: {masked}\n\n"
-        "Następny krok: skopiujemy dokładny "
-        "endpoint Stockdio z panelu Services."
+        "✅ STOCKDIO_API_KEY jest dostępny w Render."
     )
 
 
@@ -185,7 +170,7 @@ def fetch_candles(
 
 
 # =========================================================
-# EMA
+# WSKAŹNIKI
 # =========================================================
 
 def ema_series(values, period):
@@ -193,41 +178,58 @@ def ema_series(values, period):
         return []
 
     multiplier = 2 / (period + 1)
-
     result = [values[0]]
 
     for value in values[1:]:
-        new_ema = (
+        result.append(
             value * multiplier
             + result[-1] * (1 - multiplier)
         )
 
-        result.append(new_ema)
-
     return result
 
 
-# =========================================================
-# RSI
-# =========================================================
-
-def calculate_rsi(closes, period=14):
+def calculate_rsi(
+    closes,
+    period=14,
+):
     if len(closes) <= period:
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
+    for i in range(
+        1,
+        len(closes),
+    ):
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        gains.append(
+            max(change, 0)
+        )
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+        losses.append(
+            max(-change, 0)
+        )
 
-    for i in range(period, len(gains)):
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
+
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains),
+    ):
         avg_gain = (
             avg_gain * (period - 1)
             + gains[i]
@@ -243,19 +245,25 @@ def calculate_rsi(closes, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return (
+        100
+        - 100 / (1 + rs)
+    )
 
-
-# =========================================================
-# MACD
-# =========================================================
 
 def calculate_macd(closes):
     if len(closes) < 35:
         return None, None, None
 
-    ema12 = ema_series(closes, 12)
-    ema26 = ema_series(closes, 26)
+    ema12 = ema_series(
+        closes,
+        12,
+    )
+
+    ema26 = ema_series(
+        closes,
+        26,
+    )
 
     macd_line = [
         a - b
@@ -272,27 +280,21 @@ def calculate_macd(closes):
 
     macd = macd_line[-1]
     signal = signal_line[-1]
-    histogram = macd - signal
 
     return (
         macd,
         signal,
-        histogram,
+        macd - signal,
     )
 
-
-# =========================================================
-# WSPARCIE / OPÓR
-# =========================================================
 
 def calculate_support_resistance(
     candles,
     lookback=30,
 ):
-    if not candles:
-        return None, None
-
-    recent = candles[-lookback:]
+    recent = candles[
+        -lookback:
+    ]
 
     support = min(
         candle["low"]
@@ -329,7 +331,9 @@ def analyze_timeframe(
     ):
         return {
             "interval": interval,
-            "error": "Brak wystarczających danych",
+            "error": (
+                "Brak wystarczających danych"
+            ),
         }
 
     closes = [
@@ -349,13 +353,17 @@ def analyze_timeframe(
         50,
     )[-1]
 
-    rsi = calculate_rsi(closes)
+    rsi = calculate_rsi(
+        closes
+    )
 
     (
         macd,
         signal,
         histogram,
-    ) = calculate_macd(closes)
+    ) = calculate_macd(
+        closes
+    )
 
     (
         support,
@@ -366,8 +374,10 @@ def analyze_timeframe(
 
     if ema20 > ema50:
         trend = "wzrostowy"
+
     elif ema20 < ema50:
         trend = "spadkowy"
+
     else:
         trend = "neutralny"
 
@@ -378,9 +388,9 @@ def analyze_timeframe(
         "open": latest["open"],
         "high": latest["high"],
         "low": latest["low"],
-        "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
+        "rsi": rsi,
         "macd": macd,
         "signal": signal,
         "histogram": histogram,
@@ -389,10 +399,6 @@ def analyze_timeframe(
         "trend": trend,
     }
 
-
-# =========================================================
-# ANALIZA WIELU INTERWAŁÓW
-# =========================================================
 
 def build_market_analysis(
     symbol="XAUUSD",
@@ -404,17 +410,139 @@ def build_market_analysis(
         "1h",
     ]
 
-    results = []
+    return [
+        analyze_timeframe(
+            symbol,
+            interval,
+        )
+        for interval in intervals
+    ]
 
-    for interval in intervals:
-        results.append(
-            analyze_timeframe(
-                symbol,
-                interval,
-            )
+
+# =========================================================
+# KONTROLA JAKOŚCI DANYCH
+# =========================================================
+
+def parse_market_datetime(value):
+    try:
+        return datetime.strptime(
+            value,
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except Exception:
+        return None
+
+
+def validate_market_data(results):
+    """
+    Nie porównujemy czasu Twelve Data
+    bezpośrednio z zegarem serwera,
+    bo źródło może używać innej strefy.
+
+    Porównujemy interwały względem
+    najnowszej świecy 1m.
+    """
+
+    required = {
+        "1min",
+        "5min",
+        "15min",
+        "1h",
+    }
+
+    by_interval = {
+        item.get("interval"): item
+        for item in results
+    }
+
+    problems = []
+
+    for interval in required:
+        item = by_interval.get(
+            interval
         )
 
-    return results
+        if not item:
+            problems.append(
+                f"Brak {interval}"
+            )
+            continue
+
+        if "error" in item:
+            problems.append(
+                f"{interval}: {item['error']}"
+            )
+            continue
+
+        price = item.get(
+            "price"
+        )
+
+        if (
+            price is None
+            or price <= 0
+        ):
+            problems.append(
+                f"{interval}: błędna cena"
+            )
+
+    if problems:
+        return {
+            "ok": False,
+            "problems": problems,
+            "current_price": None,
+        }
+
+    one_minute = by_interval[
+        "1min"
+    ]
+
+    reference_time = parse_market_datetime(
+        one_minute["datetime"]
+    )
+
+    # Maksymalna dopuszczalna różnica
+    # względem najnowszej świecy 1m.
+    max_lag_minutes = {
+        "5min": 10,
+        "15min": 30,
+        "1h": 120,
+    }
+
+    if reference_time:
+        for interval, limit in (
+            max_lag_minutes.items()
+        ):
+            item_time = parse_market_datetime(
+                by_interval[
+                    interval
+                ]["datetime"]
+            )
+
+            if not item_time:
+                continue
+
+            lag = abs(
+                (
+                    reference_time
+                    - item_time
+                ).total_seconds()
+            ) / 60
+
+            if lag > limit:
+                problems.append(
+                    f"{interval}: "
+                    f"dane opóźnione o "
+                    f"około {lag:.0f} min"
+                )
+
+    return {
+        "ok": len(problems) == 0,
+        "problems": problems,
+        "current_price": (
+            one_minute["price"]
+        ),
+    }
 
 
 # =========================================================
@@ -425,11 +553,14 @@ def format_market_data(results):
     parts = []
 
     for data in results:
-        interval = data["interval"]
+        interval = data[
+            "interval"
+        ]
 
         if "error" in data:
             parts.append(
-                f"{interval}: {data['error']}"
+                f"{interval}: "
+                f"{data['error']}"
             )
             continue
 
@@ -465,7 +596,7 @@ Opór: {data['resistance']:.4f}
 
 
 # =========================================================
-# /START
+# TELEGRAM
 # =========================================================
 
 async def start(
@@ -481,15 +612,10 @@ async def start(
         "Analiza:\n"
         "XAUUSD\n"
         "EURUSD\n\n"
-        "Test Stockdio:\n"
-        "TEST STOCKDIO\n\n"
-        "Analizuję 1m, 5m, 15m i 1h."
+        "Bot sprawdza też jakość danych "
+        "przed wykonaniem analizy."
     )
 
-
-# =========================================================
-# /ID
-# =========================================================
 
 async def show_id(
     update: Update,
@@ -507,10 +633,6 @@ async def show_id(
     )
 
 
-# =========================================================
-# WIADOMOŚCI
-# =========================================================
-
 async def answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -521,41 +643,29 @@ async def answer(
     ):
         return
 
-    text = update.message.text.strip()
-
-
-    # =====================================================
-    # STOCKDIO TEST
-    # =====================================================
+    text = (
+        update.message.text.strip()
+    )
 
     if text.upper() in (
         "TEST STOCKDIO",
         "TEST STOCKDIO US100",
     ):
-        result = stockdio_key_status()
-
         await update.message.reply_text(
-            "🧪 TEST STOCKDIO\n\n"
-            + result
+            stockdio_key_status()
         )
-
         return
 
-
-    # =====================================================
-    # ANALIZA
-    # =====================================================
-
-    symbol = detect_symbol(text)
+    symbol = detect_symbol(
+        text
+    )
 
     if not symbol:
         await update.message.reply_text(
             "Nie rozpoznaję instrumentu.\n\n"
             "Aktualnie analizuję:\n"
             "XAUUSD\n"
-            "EURUSD\n\n"
-            "Test Stockdio:\n"
-            "TEST STOCKDIO"
+            "EURUSD"
         )
         return
 
@@ -570,6 +680,27 @@ async def answer(
                 symbol,
             )
         )
+
+        quality = validate_market_data(
+            market_results
+        )
+
+        if not quality["ok"]:
+            problems = "\n".join(
+                f"• {item}"
+                for item in quality[
+                    "problems"
+                ]
+            )
+
+            await update.message.reply_text(
+                "⚠️ DANE RYNKOWE "
+                "NIE PRZESZŁY KONTROLI\n\n"
+                f"{problems}\n\n"
+                "Nie wykonuję analizy wejścia."
+            )
+
+            return
 
         market_data = format_market_data(
             market_results
@@ -586,14 +717,14 @@ AKTUALNE DANE:
 
 {market_data}
 
-Przeanalizuj aktualny rynek.
+Dane przeszły kontrolę jakości.
 
 H1 = główny kierunek.
 15m = struktura.
 5m = momentum.
 1m = timing.
 
-Jeśli nie ma dobrego wejścia,
+Jeżeli nie ma dobrego wejścia,
 nie wymuszaj transakcji.
 """
 
@@ -612,16 +743,20 @@ nie wymuszaj transakcji.
                     "Wybierz LONG, SHORT albo CZEKAJ. "
 
                     "Jeżeli setup jest dobry, "
-                    "podaj wejście AI, SL, TP1, TP2 i TP3. "
+                    "podaj wejście AI, SL, "
+                    "TP1, TP2 i TP3. "
 
                     "Jeżeli setup jest słaby, "
-                    "napisz CZEKAJ i nie wymyślaj poziomów. "
+                    "napisz CZEKAJ. "
+
+                    "Odpowiedź ma być krótka. "
 
                     "Format:\n\n"
 
                     "📊 [INSTRUMENT]\n"
                     "Cena teraz: ...\n"
-                    "Decyzja: 🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
+                    "Decyzja: "
+                    "🟢 LONG / 🔴 SHORT / ⏳ CZEKAJ\n\n"
 
                     "Wejście AI: ...\n"
                     "SL: ...\n"
@@ -667,14 +802,9 @@ nie wymuszaj transakcji.
         )
 
         await update.message.reply_text(
-            "Wystąpił błąd podczas analizy. "
-            "Sprawdź logi Render."
+            "Wystąpił błąd podczas analizy."
         )
 
-
-# =========================================================
-# ERROR HANDLER
-# =========================================================
 
 async def error_handler(
     update: object,
@@ -686,15 +816,7 @@ async def error_handler(
     )
 
 
-# =========================================================
-# START
-# =========================================================
-
 def main():
-    logger.info(
-        "Uruchamianie Trading AI Analyzer..."
-    )
-
     application = (
         Application.builder()
         .token(
@@ -729,7 +851,9 @@ def main():
         error_handler
     )
 
-    logger.info("Bot działa.")
+    logger.info(
+        "Bot działa."
+    )
 
     application.run_polling(
         drop_pending_updates=True
