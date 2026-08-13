@@ -38,19 +38,13 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "Brak TELEGRAM_TOKEN w Render."
-    )
+    raise RuntimeError("Brak TELEGRAM_TOKEN w Render.")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "Brak OPENAI_API_KEY w Render."
-    )
+    raise RuntimeError("Brak OPENAI_API_KEY w Render.")
 
 if not TWELVE_DATA_API_KEY:
-    raise RuntimeError(
-        "Brak TWELVE_DATA_API_KEY w Render."
-    )
+    raise RuntimeError("Brak TWELVE_DATA_API_KEY w Render.")
 
 
 client = AsyncOpenAI(
@@ -72,9 +66,6 @@ SYMBOLS = {
         "api_symbol": "EUR/USD",
         "name": "EURUSD",
     },
-
-    # US100 dodamy po znalezieniu
-    # prawidłowego symbolu Twelve Data.
 }
 
 
@@ -115,9 +106,7 @@ def search_twelve_data_symbol(query):
             timeout=15,
         ) as response:
             data = json.loads(
-                response.read().decode(
-                    "utf-8"
-                )
+                response.read().decode("utf-8")
             )
 
         results = data.get(
@@ -126,9 +115,7 @@ def search_twelve_data_symbol(query):
         )
 
         if not results:
-            return (
-                "Brak wyników dla tego wyszukiwania."
-            )
+            return "Brak wyników."
 
         lines = []
 
@@ -176,9 +163,7 @@ def search_twelve_data_symbol(query):
 
         return (
             "\n\n----------------\n\n"
-        ).join(
-            lines
-        )
+        ).join(lines)
 
     except Exception as error:
         logger.exception(
@@ -187,9 +172,83 @@ def search_twelve_data_symbol(query):
         )
 
         return (
-            "Błąd podczas wyszukiwania "
-            f"symbolu: {error}"
+            f"Błąd wyszukiwania: {error}"
         )
+
+
+# =========================================================
+# TEST US100 / NASDAQ-100
+# =========================================================
+
+def test_us100_candidates():
+    candidates = [
+        "NDX",
+        "NASDAQ100",
+        "NASDAQ-100",
+        "NQX",
+        "US100",
+    ]
+
+    results = []
+
+    for symbol in candidates:
+        params = urllib.parse.urlencode(
+            {
+                "symbol": symbol,
+                "interval": "1min",
+                "outputsize": 5,
+                "apikey": TWELVE_DATA_API_KEY,
+            }
+        )
+
+        url = (
+            "https://api.twelvedata.com/"
+            f"time_series?{params}"
+        )
+
+        try:
+            with urllib.request.urlopen(
+                url,
+                timeout=15,
+            ) as response:
+                data = json.loads(
+                    response.read().decode("utf-8")
+                )
+
+            if (
+                "values" in data
+                and data["values"]
+            ):
+                latest = data[
+                    "values"
+                ][0]
+
+                results.append(
+                    f"✅ {symbol}\n"
+                    f"Cena: {latest.get('close')}\n"
+                    f"Czas: {latest.get('datetime')}"
+                )
+
+            else:
+                message = data.get(
+                    "message",
+                    "brak danych",
+                )
+
+                results.append(
+                    f"❌ {symbol}\n"
+                    f"{message}"
+                )
+
+        except Exception as error:
+            results.append(
+                f"❌ {symbol}\n"
+                f"Błąd: {error}"
+            )
+
+    return (
+        "\n\n----------------\n\n"
+    ).join(results)
 
 
 # =========================================================
@@ -225,9 +284,7 @@ def fetch_candles(
             timeout=15,
         ) as response:
             data = json.loads(
-                response.read().decode(
-                    "utf-8"
-                )
+                response.read().decode("utf-8")
             )
 
         if "values" not in data:
@@ -692,9 +749,7 @@ Opór:
         "\n\n"
         "----------------"
         "\n\n"
-    ).join(
-        parts
-    )
+    ).join(parts)
 
 
 # =========================================================
@@ -711,16 +766,15 @@ async def start(
     await update.message.reply_text(
         "Cześć! 👋\n\n"
         "Jestem Trading AI Analyzer.\n\n"
-        "Możesz napisać:\n\n"
+        "Analiza:\n"
         "XAUUSD\n"
         "EURUSD\n\n"
-        "albo np.:\n\n"
-        "Analizuj XAUUSD\n"
-        "Analizuj EURUSD\n\n"
-        "Możesz też wyszukać instrument:\n\n"
+        "Wyszukiwanie:\n"
         "SZUKAJ US100\n"
         "SZUKAJ NDX\n"
         "SZUKAJ Nasdaq 100\n\n"
+        "Test Nasdaq/US100:\n"
+        "TEST US100\n\n"
         "Analizuję 1m, 5m, 15m i 1h."
     )
 
@@ -765,6 +819,29 @@ async def answer(
 
 
     # =====================================================
+    # TEST US100
+    # =====================================================
+
+    if text.upper() == "TEST US100":
+        await update.message.chat.send_action(
+            action="typing"
+        )
+
+        result = (
+            await asyncio.to_thread(
+                test_us100_candidates
+            )
+        )
+
+        await update.message.reply_text(
+            "🧪 TEST US100 / NASDAQ-100\n\n"
+            + result
+        )
+
+        return
+
+
+    # =====================================================
     # WYSZUKIWANIE SYMBOLU
     # =====================================================
 
@@ -780,6 +857,7 @@ async def answer(
                 "Podaj nazwę instrumentu.\n"
                 "Np. SZUKAJ US100"
             )
+
             return
 
         await update.message.chat.send_action(
@@ -815,9 +893,8 @@ async def answer(
             "Aktualnie analizuję:\n"
             "XAUUSD\n"
             "EURUSD\n\n"
-            "Jeżeli chcesz znaleźć nowy symbol, "
-            "napisz np.:\n\n"
-            "SZUKAJ US100"
+            "Do testu US100 wpisz:\n"
+            "TEST US100"
         )
 
         return
@@ -854,11 +931,8 @@ AKTUALNE DANE RYNKOWE:
 Przeanalizuj aktualny rynek.
 
 H1 traktuj jako główny kierunek.
-
 15m służy do oceny struktury.
-
 5m służy do oceny momentum.
-
 1m służy do znalezienia timingu wejścia.
 
 Jeżeli nie ma sensownego wejścia,
@@ -938,10 +1012,7 @@ nie wymuszaj transakcji.
 
         answer_text = (
             response.output_text
-            or (
-                "AI nie zwróciło "
-                "odpowiedzi."
-            )
+            or "AI nie zwróciło odpowiedzi."
         )
 
         for i in range(
