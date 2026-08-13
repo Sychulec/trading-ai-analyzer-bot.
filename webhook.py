@@ -11,7 +11,11 @@ import urllib.request
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
-from bot import build_market_analysis, format_market_data
+from bot import (
+    build_market_analysis,
+    format_market_data,
+    validate_market_data,
+)
 
 
 # =========================================================
@@ -61,10 +65,10 @@ client = OpenAI(
 
 
 # =========================================================
-# USTAWIENIA MONITOROWANIA
+# USTAWIENIA
 # =========================================================
 
-# Co ile sekund ponownie sprawdzać setup.
+# Co ile sekund ponownie sprawdzamy setup.
 # 300 sekund = 5 minut.
 MONITOR_INTERVAL_SECONDS = int(
     os.getenv(
@@ -73,7 +77,7 @@ MONITOR_INTERVAL_SECONDS = int(
     )
 )
 
-# Ile razy maksymalnie sprawdzić setup.
+# Maksymalnie 12 sprawdzeń.
 # 12 x 5 minut = około 1 godzina.
 MONITOR_MAX_CHECKS = int(
     os.getenv(
@@ -82,21 +86,23 @@ MONITOR_MAX_CHECKS = int(
     )
 )
 
+# Maksymalna różnica między ceną alertu TradingView
+# i aktualną ceną Twelve Data przy PIERWSZEJ analizie.
+# 0.15 = 0,15%
+MAX_PRICE_DIFF_PERCENT = float(
+    os.getenv(
+        "MAX_PRICE_DIFF_PERCENT",
+        "0.15",
+    )
+)
+
 
 # =========================================================
-# AKTYWNE SETUPY
+# AKTYWNE MONITORY
 # =========================================================
 
 monitor_lock = threading.Lock()
 
-# Przykład:
-# {
-#   "XAUUSD": {
-#       "id": "...",
-#       "side": "LONG",
-#       "started": 1234567890
-#   }
-# }
 active_monitors = {}
 
 
@@ -110,7 +116,6 @@ def send_telegram_message(text):
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    # Telegram ma limit pojedynczej wiadomości.
     for i in range(
         0,
         len(text),
@@ -179,6 +184,10 @@ def extract_number(
 def parse_alert(text):
     upper = text.upper()
 
+    # -----------------------------------------------------
+    # TYP ALERTU
+    # -----------------------------------------------------
+
     if "WEJŚCIE LONG" in upper:
         event = "ENTRY"
         side = "LONG"
@@ -199,6 +208,9 @@ def parse_alert(text):
         event = "UNKNOWN"
         side = None
 
+    # -----------------------------------------------------
+    # SYMBOL
+    # -----------------------------------------------------
 
     if "XAUUSD" in upper:
         symbol = "XAUUSD"
@@ -209,6 +221,9 @@ def parse_alert(text):
     else:
         symbol = "UNKNOWN"
 
+    # -----------------------------------------------------
+    # TIMEFRAME
+    # -----------------------------------------------------
 
     tf_match = re.search(
         r"(?:XAUUSD|US100)\s+([A-Za-z0-9]+)\s*-",
@@ -222,6 +237,9 @@ def parse_alert(text):
         else "?"
     )
 
+    # -----------------------------------------------------
+    # POZIOMY STRATEGII
+    # -----------------------------------------------------
 
     strategy_entry = extract_number(
         r"Cena:\s*([0-9.,]+)",
@@ -238,7 +256,6 @@ def parse_alert(text):
         text,
     )
 
-
     return {
         "event": event,
         "side": side,
@@ -252,22 +269,23 @@ def parse_alert(text):
 
 
 # =========================================================
-# ANALIZA AI
+# KONTROLA DANYCH + ANALIZA AI
 # =========================================================
 
 def analyze_h1_setup(
     signal,
     monitoring=False,
 ):
+    # -----------------------------------------------------
+    # POBIERANIE DANYCH
+    # -----------------------------------------------------
+
     try:
-        # Jawnie analizujemy XAUUSD,
-        # żeby przyszłe zmiany bot.py
-        # nie zmieniły przypadkiem instrumentu.
         market_results = build_market_analysis(
             "XAUUSD"
         )
 
-        market_data = format_market_data(
+        quality = validate_market_data(
             market_results
         )
 
@@ -280,30 +298,124 @@ def analyze_h1_setup(
         return {
             "decision": "ERROR",
             "message": (
-                "⚠️ XAUUSD\n"
-                "Nie udało się pobrać danych rynkowych."
+                "⚠️ XAUUSD\n\n"
+                "Nie udało się pobrać "
+                "danych rynkowych."
             ),
         }
 
+    # -----------------------------------------------------
+    # KONTROLA JAKOŚCI DANYCH
+    # -----------------------------------------------------
+
+    if not quality["ok"]:
+        problems = "\n".join(
+            f"• {problem}"
+            for problem in quality[
+                "problems"
+            ]
+        )
+
+        logger.warning(
+            "Dane nie przeszły kontroli: %s",
+            quality["problems"],
+        )
+
+        return {
+            "decision": "WAIT",
+            "message": (
+                "⚠️ KONTROLA DANYCH\n\n"
+                f"{problems}\n\n"
+                "⏳ CZEKAJ — "
+                "nie potwierdzam wejścia, "
+                "dopóki dane nie będą poprawne."
+            ),
+        }
+
+    current_price = quality[
+        "current_price"
+    ]
+
+    # -----------------------------------------------------
+    # PORÓWNANIE TRADINGVIEW ↔ TWELVE DATA
+    #
+    # Robimy je TYLKO przy pierwszej analizie.
+    # Podczas monitorowania cena ma prawo oddalić się
+    # od pierwotnego sygnału.
+    # -----------------------------------------------------
+
+    strategy_price = signal.get(
+        "strategy_entry"
+    )
+
+    if (
+        not monitoring
+        and strategy_price
+        and current_price
+    ):
+        difference_percent = (
+            abs(
+                current_price
+                - strategy_price
+            )
+            / strategy_price
+            * 100
+        )
+
+        logger.info(
+            "Porównanie cen: TradingView=%.4f "
+            "TwelveData=%.4f różnica=%.4f%%",
+            strategy_price,
+            current_price,
+            difference_percent,
+        )
+
+        if (
+            difference_percent
+            > MAX_PRICE_DIFF_PERCENT
+        ):
+            return {
+                "decision": "WAIT",
+                "message": (
+                    "⚠️ RÓŻNICA CEN\n\n"
+                    f"TradingView: "
+                    f"{strategy_price:.2f}\n"
+                    f"Twelve Data: "
+                    f"{current_price:.2f}\n"
+                    f"Różnica: "
+                    f"{difference_percent:.3f}%\n\n"
+                    "⏳ CZEKAJ — "
+                    "ceny wymagają ponownego "
+                    "sprawdzenia."
+                ),
+            }
+
+    # -----------------------------------------------------
+    # FORMAT DANYCH DLA AI
+    # -----------------------------------------------------
+
+    market_data = format_market_data(
+        market_results
+    )
 
     if monitoring:
-        analysis_mode = (
-            "To jest PONOWNA analiza wcześniej "
-            "aktywnego setupu. Sprawdź, czy warunki "
-            "do wejścia pojawiły się TERAZ."
+        mode = (
+            "To jest PONOWNA analiza "
+            "wcześniej aktywnego setupu. "
+            "Sprawdź, czy warunki do wejścia "
+            "są dobre TERAZ."
         )
 
     else:
-        analysis_mode = (
-            "To jest PIERWSZA analiza nowego "
-            "sygnału H1 z TradingView."
+        mode = (
+            "To jest PIERWSZA analiza "
+            "nowego sygnału H1."
         )
 
-
     prompt = f"""
-{analysis_mode}
+{mode}
 
-SYGNAŁ BAZOWY Z TRADINGVIEW
+SYGNAŁ Z TRADINGVIEW
 
 Instrument:
 {signal["symbol"]}
@@ -314,7 +426,7 @@ Timeframe:
 Kierunek strategii:
 {signal["side"]}
 
-Cena sygnału strategii:
+Cena strategii:
 {signal["strategy_entry"]}
 
 SL strategii:
@@ -324,38 +436,42 @@ TP strategii:
 {signal["strategy_tp"]}
 
 
-AKTUALNE DANE RYNKOWE:
+AKTUALNA CENA TWELVE DATA:
+
+{current_price}
+
+
+AKTUALNE DANE TECHNICZNE:
 
 {market_data}
 
 
 ZADANIE:
 
-H1 jest głównym interwałem kierunkowym.
+H1 jest głównym kierunkiem.
 
 15m służy do oceny struktury.
 
 5m służy do oceny momentum.
 
-1m służy do określenia timingu wejścia.
+1m służy do timingu wejścia.
 
-TradingView daje tylko sygnał bazowy.
+TradingView daje tylko kierunek bazowy.
 
-Samodzielnie oceń, czy setup ma sens TERAZ.
+Sam oceń, czy wejście ma sens teraz.
 
 Nie musisz kopiować ceny wejścia,
-SL ani TP strategii TradingView.
+SL ani TP strategii.
 
-Jeżeli setup ma sens,
+Jeżeli setup jest dobry,
 zaproponuj własne poziomy.
 
 Jeżeli jeszcze za wcześnie,
 wybierz CZEKAJ.
 
-Jeżeli setup stracił sens,
+Jeżeli setup się zepsuł,
 wybierz POMIN.
 """
-
 
     instructions = """
 Odpowiadaj po polsku.
@@ -364,71 +480,73 @@ Jesteś Trading AI Analyzer.
 
 Analizujesz XAUUSD.
 
-TradingView daje sygnał bazowy LONG albo SHORT,
-ale ostateczną ocenę robisz na podstawie
-aktualnych danych rynkowych.
+Masz aktualne dane:
+1m,
+5m,
+15m,
+1h.
 
-Analizuj:
-
-1h = główny kierunek
-15m = struktura
-5m = momentum
-1m = timing
+1h = główny kierunek.
+15m = struktura.
+5m = momentum.
+1m = timing.
 
 Uwzględniaj:
+EMA20,
+EMA50,
+RSI,
+MACD,
+histogram MACD,
+wsparcie,
+opór,
+aktualną cenę.
 
-- aktualną cenę
-- EMA20
-- EMA50
-- RSI
-- MACD
-- histogram MACD
-- wsparcie
-- opór
-- zgodność interwałów
+TradingView daje sygnał bazowy
+LONG albo SHORT.
 
+Nie kopiuj bezmyślnie poziomów
+ze strategii TradingView.
 
-Wybierz DOKŁADNIE jedną decyzję:
+Wybierz dokładnie jedną decyzję:
 
 WEJSCIE
 
-gdy aktualne warunki wystarczająco
-potwierdzają setup i wejście ma sens teraz.
+gdy warunki wystarczająco
+potwierdzają wejście teraz.
 
 CZEKAJ
 
-gdy kierunek H1 nadal ma sens,
-ale cena albo niższe interwały
-nie dają jeszcze dobrego wejścia.
+gdy setup nadal ma sens,
+ale timing nie jest jeszcze dobry.
 
 POMIN
 
-gdy setup przestał mieć sens,
-rynek wyraźnie przeczy kierunkowi
-albo nie ma sensownego risk/reward.
+gdy setup stracił sens,
+interwały wyraźnie przeczą kierunkowi
+albo risk/reward jest niekorzystny.
 
+Jeżeli decyzja to WEJSCIE albo CZEKAJ:
 
-Jeżeli wybierasz WEJSCIE lub CZEKAJ:
+podaj:
+- własną cenę lub wąską strefę wejścia,
+- SL,
+- TP1,
+- TP2,
+- TP3.
 
-- podaj własną cenę albo wąską strefę wejścia
-- podaj SL
-- podaj TP1
-- podaj TP2
-- podaj TP3
+SL powinien znajdować się
+za logicznym poziomem unieważnienia.
 
-SL powinien być za logicznym poziomem
-unieważnienia setupu.
-
-TP powinny wynikać z danych,
-wsparć, oporów i rozsądnego R:R.
+TP powinny wynikać
+ze wsparć, oporów i struktury rynku.
 
 Nie wymyślaj danych.
 
-Jeżeli setup jest niejasny,
-wybierz CZEKAJ zamiast zgadywać.
+Jeżeli układ jest niejasny,
+wybierz CZEKAJ.
 
 
-PIERWSZA LINIA ODPOWIEDZI MUSI BYĆ:
+PIERWSZA LINIA MUSI BYĆ:
 
 DECYZJA=WEJSCIE
 
@@ -441,7 +559,7 @@ albo:
 DECYZJA=POMIN
 
 
-Dalej użyj dokładnie takiego układu:
+Dalej użyj formatu:
 
 🟢 XAUUSD LONG — H1
 albo
@@ -462,15 +580,19 @@ TP3: [cena / -]
 15m: [✅ / ⚠️ / ❌]
 1h: [✅ / ⚠️ / ❌]
 
-Warunek wejścia: [jedno krótkie zdanie]
+Warunek wejścia:
+[jedno krótkie zdanie]
 
-Unieważnienie: [jedno krótkie zdanie]
+Unieważnienie:
+[jedno krótkie zdanie]
 
 Nie pisz długiego komentarza.
-
 Nie gwarantuj zysku.
 """
 
+    # -----------------------------------------------------
+    # OPENAI
+    # -----------------------------------------------------
 
     try:
         response = client.responses.create(
@@ -494,13 +616,16 @@ Nie gwarantuj zysku.
             "decision": "ERROR",
             "message": (
                 "⚠️ XAUUSD\n"
-                "Wystąpił błąd podczas analizy AI."
+                "Wystąpił błąd "
+                "podczas analizy AI."
             ),
         }
 
+    # -----------------------------------------------------
+    # ODCZYT DECYZJI
+    # -----------------------------------------------------
 
     upper = answer.upper()
-
 
     if "DECYZJA=WEJSCIE" in upper:
         decision = "ENTRY"
@@ -514,17 +639,15 @@ Nie gwarantuj zysku.
     else:
         decision = "UNKNOWN"
 
-
-    # Usuwamy linię techniczną DECYZJA=...
-    # zanim wyślemy tekst na Telegram.
+    # Usuwamy techniczną linię DECYZJA=...
     display_answer = re.sub(
-        r"^\s*DECYZJA\s*=\s*[A-ZĄĆĘŁŃÓŚŹŻ]+\s*",
+        r"^\s*DECYZJA\s*=\s*"
+        r"[A-ZĄĆĘŁŃÓŚŹŻ]+\s*",
         "",
         answer,
         count=1,
         flags=re.IGNORECASE,
     ).strip()
-
 
     return {
         "decision": decision,
@@ -540,14 +663,15 @@ def monitor_setup(
     signal,
     monitor_id,
 ):
-    symbol = signal["symbol"]
+    symbol = signal[
+        "symbol"
+    ]
 
     logger.info(
         "Start monitorowania %s | ID=%s",
         symbol,
         monitor_id,
     )
-
 
     for check_number in range(
         1,
@@ -557,9 +681,10 @@ def monitor_setup(
             MONITOR_INTERVAL_SECONDS
         )
 
+        # -------------------------------------------------
+        # CZY MONITOR NADAL JEST AKTYWNY
+        # -------------------------------------------------
 
-        # Sprawdzamy, czy ten monitor
-        # nadal jest aktualny.
         with monitor_lock:
             active = active_monitors.get(
                 symbol
@@ -567,14 +692,15 @@ def monitor_setup(
 
             if (
                 not active
-                or active.get("id") != monitor_id
+                or active.get("id")
+                != monitor_id
             ):
                 logger.info(
-                    "Monitor %s został zastąpiony/anulowany.",
+                    "Monitor %s "
+                    "został zastąpiony.",
                     monitor_id,
                 )
                 return
-
 
         logger.info(
             "Ponowna analiza %s/%s | %s",
@@ -583,6 +709,9 @@ def monitor_setup(
             symbol,
         )
 
+        # -------------------------------------------------
+        # PONOWNA ANALIZA
+        # -------------------------------------------------
 
         result = analyze_h1_setup(
             signal,
@@ -593,10 +722,9 @@ def monitor_setup(
             "decision"
         ]
 
-
-        # =====================================
+        # -------------------------------------------------
         # WEJŚCIE
-        # =====================================
+        # -------------------------------------------------
 
         if decision == "ENTRY":
             send_telegram_message(
@@ -611,7 +739,8 @@ def monitor_setup(
 
                 if (
                     current
-                    and current.get("id") == monitor_id
+                    and current.get("id")
+                    == monitor_id
                 ):
                     active_monitors.pop(
                         symbol,
@@ -619,16 +748,15 @@ def monitor_setup(
                     )
 
             logger.info(
-                "Setup %s potwierdzony.",
+                "Setup potwierdzony: %s",
                 monitor_id,
             )
 
             return
 
-
-        # =====================================
-        # SETUP UNIEWAŻNIONY
-        # =====================================
+        # -------------------------------------------------
+        # SETUP ANULOWANY
+        # -------------------------------------------------
 
         if decision == "SKIP":
             send_telegram_message(
@@ -643,7 +771,8 @@ def monitor_setup(
 
                 if (
                     current
-                    and current.get("id") == monitor_id
+                    and current.get("id")
+                    == monitor_id
                 ):
                     active_monitors.pop(
                         symbol,
@@ -651,21 +780,19 @@ def monitor_setup(
                     )
 
             logger.info(
-                "Setup %s anulowany.",
+                "Setup anulowany: %s",
                 monitor_id,
             )
 
             return
 
+        # WAIT / ERROR / UNKNOWN
+        # nic nie wysyłamy.
+        # Dalej obserwujemy.
 
-        # WAIT / UNKNOWN / ERROR:
-        # nie wysyłamy wiadomości.
-        # Dalej obserwujemy setup.
-
-
-    # =========================================
-    # KONIEC CZASU MONITOROWANIA
-    # =========================================
+    # -----------------------------------------------------
+    # KONIEC CZASU OBSERWACJI
+    # -----------------------------------------------------
 
     with monitor_lock:
         current = active_monitors.get(
@@ -674,28 +801,23 @@ def monitor_setup(
 
         if (
             current
-            and current.get("id") == monitor_id
+            and current.get("id")
+            == monitor_id
         ):
             active_monitors.pop(
                 symbol,
                 None,
             )
 
-
     send_telegram_message(
         "⌛ XAUUSD — OBSERWACJA ZAKOŃCZONA\n\n"
-        "Setup nie dał wystarczającego "
+        "Setup nie uzyskał wystarczającego "
         "potwierdzenia w czasie obserwacji."
-    )
-
-    logger.info(
-        "Monitor %s zakończony czasowo.",
-        monitor_id,
     )
 
 
 # =========================================================
-# OBSŁUGA NOWEGO ALERTU
+# OBSŁUGA ALERTU TRADINGVIEW
 # =========================================================
 
 def process_alert(text):
@@ -704,21 +826,18 @@ def process_alert(text):
         text,
     )
 
-
     signal = parse_alert(
         text
     )
-
 
     logger.info(
         "Rozpoznany sygnał: %s",
         signal,
     )
 
-
-    # =====================================================
-    # IGNORUJEMY TP / SL / INNE
-    # =====================================================
+    # -----------------------------------------------------
+    # IGNORUJEMY TP / SL / INNE ALERTY
+    # -----------------------------------------------------
 
     if signal["event"] != "ENTRY":
         logger.info(
@@ -727,10 +846,9 @@ def process_alert(text):
         )
         return
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # TYLKO XAUUSD
-    # =====================================================
+    # -----------------------------------------------------
 
     if signal["symbol"] != "XAUUSD":
         logger.info(
@@ -739,15 +857,13 @@ def process_alert(text):
         )
         return
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # TYLKO H1
-    # =====================================================
+    # -----------------------------------------------------
 
     timeframe = str(
         signal["timeframe"]
     ).lower()
-
 
     if timeframe not in (
         "1h",
@@ -760,10 +876,9 @@ def process_alert(text):
         )
         return
 
-
-    # =====================================================
-    # INFORMACJA: STRATEGIA WESZŁA
-    # =====================================================
+    # -----------------------------------------------------
+    # INFORMACJA, ŻE STRATEGIA DAŁA SYGNAŁ
+    # -----------------------------------------------------
 
     side_icon = (
         "🟢"
@@ -771,19 +886,21 @@ def process_alert(text):
         else "🔴"
     )
 
-
     send_telegram_message(
-        f"📡 STRATEGIA H1 — {signal['side']}\n\n"
-        f"{side_icon} XAUUSD {signal['side']}\n"
-        f"Cena sygnału: {signal['strategy_entry']}\n\n"
-        "🤖 AI sprawdza teraz "
-        "1h / 15m / 5m / 1m."
+        f"📡 STRATEGIA H1 — "
+        f"{signal['side']}\n\n"
+        f"{side_icon} XAUUSD "
+        f"{signal['side']}\n"
+        f"Cena sygnału: "
+        f"{signal['strategy_entry']}\n\n"
+        "🤖 Sprawdzam zgodność ceny "
+        "TradingView z Twelve Data "
+        "oraz 1h / 15m / 5m / 1m."
     )
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # PIERWSZA ANALIZA
-    # =====================================================
+    # -----------------------------------------------------
 
     result = analyze_h1_setup(
         signal,
@@ -794,10 +911,9 @@ def process_alert(text):
         "decision"
     ]
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # WEJŚCIE OD RAZU
-    # =====================================================
+    # -----------------------------------------------------
 
     if decision == "ENTRY":
         send_telegram_message(
@@ -805,8 +921,6 @@ def process_alert(text):
             + result["message"]
         )
 
-        # Anulujemy wcześniejszy monitor,
-        # jeśli jakiś istniał.
         with monitor_lock:
             active_monitors.pop(
                 signal["symbol"],
@@ -815,10 +929,9 @@ def process_alert(text):
 
         return
 
-
-    # =====================================================
-    # POMIŃ
-    # =====================================================
+    # -----------------------------------------------------
+    # SETUP ODRZUCONY
+    # -----------------------------------------------------
 
     if decision == "SKIP":
         send_telegram_message(
@@ -834,28 +947,24 @@ def process_alert(text):
 
         return
 
-
-    # =====================================================
+    # -----------------------------------------------------
     # CZEKAJ
-    # =====================================================
+    # -----------------------------------------------------
 
     if decision == "WAIT":
         send_telegram_message(
-            "⏳ AI CZEKA — SETUP OBSERWOWANY\n\n"
+            "⏳ AI CZEKA — "
+            "SETUP OBSERWOWANY\n\n"
             + result["message"]
             + "\n\n"
-            "🔄 Bot będzie ponownie "
-            "sprawdzał rynek co 5 minut."
+            "🔄 Bot sprawdzi rynek "
+            "ponownie co 5 minut."
         )
-
 
         monitor_id = str(
             uuid.uuid4()
         )
 
-
-        # Nowy setup XAUUSD zastępuje
-        # poprzedni aktywny monitor.
         with monitor_lock:
             active_monitors[
                 signal["symbol"]
@@ -864,7 +973,6 @@ def process_alert(text):
                 "side": signal["side"],
                 "started": time.time(),
             }
-
 
         monitor_thread = threading.Thread(
             target=monitor_setup,
@@ -877,22 +985,30 @@ def process_alert(text):
 
         monitor_thread.start()
 
-
         logger.info(
-            "Uruchomiono monitor %s dla %s.",
+            "Uruchomiono monitor %s",
             monitor_id,
-            signal["side"],
         )
 
         return
 
+    # -----------------------------------------------------
+    # BŁĄD
+    # -----------------------------------------------------
 
-    # =====================================================
-    # NIEJEDNOZNACZNA ODPOWIEDŹ AI
-    # =====================================================
+    if decision == "ERROR":
+        send_telegram_message(
+            result["message"]
+        )
+        return
+
+    # -----------------------------------------------------
+    # NIEJEDNOZNACZNA DECYZJA
+    # -----------------------------------------------------
 
     send_telegram_message(
-        "⚠️ AI NIE ROZPOZNAŁO JEDNOZNACZNIE DECYZJI\n\n"
+        "⚠️ AI NIE ROZPOZNAŁO "
+        "JEDNOZNACZNEJ DECYZJI\n\n"
         + result["message"]
     )
 
@@ -907,7 +1023,7 @@ def process_alert(text):
 )
 def home():
     with monitor_lock:
-        monitor_info = dict(
+        monitors = dict(
             active_monitors
         )
 
@@ -923,7 +1039,10 @@ def home():
             "monitor_max_checks": (
                 MONITOR_MAX_CHECKS
             ),
-            "active_monitors": monitor_info,
+            "max_price_diff_percent": (
+                MAX_PRICE_DIFF_PERCENT
+            ),
+            "active_monitors": monitors,
         }
     )
 
@@ -951,10 +1070,13 @@ def health():
     methods=["POST"],
 )
 def webhook():
+    # -----------------------------------------------------
+    # SECRET
+    # -----------------------------------------------------
+
     secret = request.args.get(
         "secret"
     )
-
 
     if secret != WEBHOOK_SECRET:
         return jsonify(
@@ -963,6 +1085,9 @@ def webhook():
             }
         ), 403
 
+    # -----------------------------------------------------
+    # ODCZYT WIADOMOŚCI
+    # -----------------------------------------------------
 
     try:
         if request.is_json:
@@ -988,7 +1113,6 @@ def webhook():
                 as_text=True
             )
 
-
     except Exception as error:
         logger.exception(
             "Błąd odczytu webhooka: %s",
@@ -1001,7 +1125,6 @@ def webhook():
             }
         ), 400
 
-
     if not text or not text.strip():
         return jsonify(
             {
@@ -1009,9 +1132,10 @@ def webhook():
             }
         ), 400
 
+    # -----------------------------------------------------
+    # ANALIZA W TLE
+    # -----------------------------------------------------
 
-    # TradingView dostaje odpowiedź od razu,
-    # a analiza działa w osobnym wątku.
     thread = threading.Thread(
         target=process_alert,
         args=(text,),
@@ -1020,7 +1144,7 @@ def webhook():
 
     thread.start()
 
-
+    # TradingView dostaje odpowiedź natychmiast.
     return jsonify(
         {
             "status": "accepted",
