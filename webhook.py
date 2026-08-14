@@ -8,6 +8,11 @@ import threading
 import urllib.parse
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
@@ -33,7 +38,7 @@ app = Flask(__name__)
 
 
 # =========================================================
-# ENVIRONMENT VARIABLES
+# ENV
 # =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -68,8 +73,7 @@ client = OpenAI(
 # USTAWIENIA
 # =========================================================
 
-# Co ile sekund ponownie sprawdzamy setup.
-# 300 sekund = 5 minut.
+# Monitoring sygnału strategii.
 MONITOR_INTERVAL_SECONDS = int(
     os.getenv(
         "MONITOR_INTERVAL_SECONDS",
@@ -77,8 +81,6 @@ MONITOR_INTERVAL_SECONDS = int(
     )
 )
 
-# Maksymalnie 12 sprawdzeń.
-# 12 x 5 minut = około 1 godzina.
 MONITOR_MAX_CHECKS = int(
     os.getenv(
         "MONITOR_MAX_CHECKS",
@@ -86,9 +88,30 @@ MONITOR_MAX_CHECKS = int(
     )
 )
 
-# Maksymalna różnica między ceną alertu TradingView
-# i aktualną ceną Twelve Data przy PIERWSZEJ analizie.
-# 0.15 = 0,15%
+# Automatyczny skaner rynku.
+AUTO_SCAN_ENABLED = (
+    os.getenv(
+        "AUTO_SCAN_ENABLED",
+        "true",
+    ).lower()
+    == "true"
+)
+
+AUTO_SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "AUTO_SCAN_INTERVAL_SECONDS",
+        "300",
+    )
+)
+
+# Ile czasu nie powtarzać identycznego alertu.
+AUTO_ALERT_COOLDOWN_SECONDS = int(
+    os.getenv(
+        "AUTO_ALERT_COOLDOWN_SECONDS",
+        "1800",
+    )
+)
+
 MAX_PRICE_DIFF_PERCENT = float(
     os.getenv(
         "MAX_PRICE_DIFF_PERCENT",
@@ -98,12 +121,25 @@ MAX_PRICE_DIFF_PERCENT = float(
 
 
 # =========================================================
-# AKTYWNE MONITORY
+# STAN
 # =========================================================
 
 monitor_lock = threading.Lock()
+auto_lock = threading.Lock()
 
 active_monitors = {}
+
+auto_state = {
+    "last_key": None,
+    "last_sent_at": 0,
+    "last_status": "NONE",
+    "last_direction": "NONE",
+}
+
+scanner_started = False
+scanner_start_lock = threading.Lock()
+
+scanner_lock_file = None
 
 
 # =========================================================
@@ -147,13 +183,13 @@ def send_telegram_message(text):
 
         except Exception as error:
             logger.exception(
-                "Błąd wysyłania Telegram: %s",
+                "Błąd Telegram: %s",
                 error,
             )
 
 
 # =========================================================
-# PARSOWANIE ALERTU TRADINGVIEW
+# ALERT TRADINGVIEW
 # =========================================================
 
 def extract_number(
@@ -184,10 +220,6 @@ def extract_number(
 def parse_alert(text):
     upper = text.upper()
 
-    # -----------------------------------------------------
-    # TYP ALERTU
-    # -----------------------------------------------------
-
     if "WEJŚCIE LONG" in upper:
         event = "ENTRY"
         side = "LONG"
@@ -208,9 +240,6 @@ def parse_alert(text):
         event = "UNKNOWN"
         side = None
 
-    # -----------------------------------------------------
-    # SYMBOL
-    # -----------------------------------------------------
 
     if "XAUUSD" in upper:
         symbol = "XAUUSD"
@@ -221,12 +250,10 @@ def parse_alert(text):
     else:
         symbol = "UNKNOWN"
 
-    # -----------------------------------------------------
-    # TIMEFRAME
-    # -----------------------------------------------------
 
     tf_match = re.search(
-        r"(?:XAUUSD|US100)\s+([A-Za-z0-9]+)\s*-",
+        r"(?:XAUUSD|US100)\s+"
+        r"([A-Za-z0-9]+)\s*-",
         text,
         re.IGNORECASE,
     )
@@ -237,123 +264,725 @@ def parse_alert(text):
         else "?"
     )
 
-    # -----------------------------------------------------
-    # POZIOMY STRATEGII
-    # -----------------------------------------------------
-
-    strategy_entry = extract_number(
-        r"Cena:\s*([0-9.,]+)",
-        text,
-    )
-
-    strategy_tp = extract_number(
-        r"TP:\s*([0-9.,]+)",
-        text,
-    )
-
-    strategy_sl = extract_number(
-        r"SL:\s*([0-9.,]+)",
-        text,
-    )
 
     return {
         "event": event,
         "side": side,
         "symbol": symbol,
         "timeframe": timeframe,
-        "strategy_entry": strategy_entry,
-        "strategy_tp": strategy_tp,
-        "strategy_sl": strategy_sl,
+
+        "strategy_entry": extract_number(
+            r"Cena:\s*([0-9.,]+)",
+            text,
+        ),
+
+        "strategy_tp": extract_number(
+            r"TP:\s*([0-9.,]+)",
+            text,
+        ),
+
+        "strategy_sl": extract_number(
+            r"SL:\s*([0-9.,]+)",
+            text,
+        ),
+
         "raw": text,
     }
 
 
 # =========================================================
-# KONTROLA DANYCH + ANALIZA AI
+# WSKAŹNIKI DLA H4 / D1
 # =========================================================
 
-def analyze_h1_setup(
-    signal,
-    monitoring=False,
+def ema_series(
+    values,
+    period,
 ):
-    # -----------------------------------------------------
-    # POBIERANIE DANYCH
-    # -----------------------------------------------------
+    if not values:
+        return []
+
+    multiplier = (
+        2 / (period + 1)
+    )
+
+    result = [
+        values[0]
+    ]
+
+    for value in values[1:]:
+        result.append(
+            value * multiplier
+            + result[-1]
+            * (1 - multiplier)
+        )
+
+    return result
+
+
+def calculate_rsi(
+    closes,
+    period=14,
+):
+    if len(closes) <= period:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(
+        1,
+        len(closes),
+    ):
+        change = (
+            closes[i]
+            - closes[i - 1]
+        )
+
+        gains.append(
+            max(
+                change,
+                0,
+            )
+        )
+
+        losses.append(
+            max(
+                -change,
+                0,
+            )
+        )
+
+    avg_gain = (
+        sum(
+            gains[:period]
+        )
+        / period
+    )
+
+    avg_loss = (
+        sum(
+            losses[:period]
+        )
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains),
+    ):
+        avg_gain = (
+            avg_gain
+            * (period - 1)
+            + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss
+            * (period - 1)
+            + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = (
+        avg_gain
+        / avg_loss
+    )
+
+    return (
+        100
+        - (
+            100
+            / (1 + rs)
+        )
+    )
+
+
+def calculate_macd(
+    closes,
+):
+    if len(closes) < 35:
+        return (
+            None,
+            None,
+            None,
+        )
+
+    ema12 = ema_series(
+        closes,
+        12,
+    )
+
+    ema26 = ema_series(
+        closes,
+        26,
+    )
+
+    macd_line = [
+        a - b
+        for a, b in zip(
+            ema12,
+            ema26,
+        )
+    ]
+
+    signal_line = ema_series(
+        macd_line,
+        9,
+    )
+
+    macd = macd_line[-1]
+    signal = signal_line[-1]
+
+    return (
+        macd,
+        signal,
+        macd - signal,
+    )
+
+
+# =========================================================
+# TWELVE DATA H4 / D1
+# =========================================================
+
+def fetch_extra_timeframe(
+    interval,
+    outputsize=120,
+):
+    params = urllib.parse.urlencode(
+        {
+            "symbol": "XAU/USD",
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": TWELVE_DATA_API_KEY,
+        }
+    )
+
+    url = (
+        "https://api.twelvedata.com/"
+        f"time_series?{params}"
+    )
 
     try:
-        market_results = build_market_analysis(
-            "XAUUSD"
+        with urllib.request.urlopen(
+            url,
+            timeout=15,
+        ) as response:
+            data = json.loads(
+                response.read().decode(
+                    "utf-8"
+                )
+            )
+
+        if "values" not in data:
+            return {
+                "interval": interval,
+                "error": (
+                    data.get(
+                        "message",
+                        "Brak danych",
+                    )
+                ),
+            }
+
+        candles = []
+
+        for item in reversed(
+            data["values"]
+        ):
+            candles.append(
+                {
+                    "datetime": item[
+                        "datetime"
+                    ],
+                    "open": float(
+                        item["open"]
+                    ),
+                    "high": float(
+                        item["high"]
+                    ),
+                    "low": float(
+                        item["low"]
+                    ),
+                    "close": float(
+                        item["close"]
+                    ),
+                }
+            )
+
+        if len(candles) < 55:
+            return {
+                "interval": interval,
+                "error": (
+                    "Za mało danych"
+                ),
+            }
+
+        closes = [
+            candle["close"]
+            for candle in candles
+        ]
+
+        latest = candles[-1]
+
+        ema20 = ema_series(
+            closes,
+            20,
+        )[-1]
+
+        ema50 = ema_series(
+            closes,
+            50,
+        )[-1]
+
+        rsi = calculate_rsi(
+            closes
         )
 
-        quality = validate_market_data(
-            market_results
+        (
+            macd,
+            signal,
+            histogram,
+        ) = calculate_macd(
+            closes
         )
+
+        recent = candles[-30:]
+
+        support = min(
+            candle["low"]
+            for candle in recent
+        )
+
+        resistance = max(
+            candle["high"]
+            for candle in recent
+        )
+
+        if ema20 > ema50:
+            trend = "wzrostowy"
+
+        elif ema20 < ema50:
+            trend = "spadkowy"
+
+        else:
+            trend = "neutralny"
+
+        return {
+            "interval": interval,
+            "datetime": latest[
+                "datetime"
+            ],
+            "price": latest[
+                "close"
+            ],
+            "open": latest[
+                "open"
+            ],
+            "high": latest[
+                "high"
+            ],
+            "low": latest[
+                "low"
+            ],
+            "rsi": rsi,
+            "ema20": ema20,
+            "ema50": ema50,
+            "macd": macd,
+            "signal": signal,
+            "histogram": histogram,
+            "support": support,
+            "resistance": resistance,
+            "trend": trend,
+        }
 
     except Exception as error:
         logger.exception(
-            "Błąd pobierania danych rynkowych: %s",
+            "Błąd dodatkowego TF %s: %s",
+            interval,
             error,
         )
 
         return {
-            "decision": "ERROR",
-            "message": (
-                "⚠️ XAUUSD\n\n"
-                "Nie udało się pobrać "
-                "danych rynkowych."
-            ),
+            "interval": interval,
+            "error": str(error),
         }
 
-    # -----------------------------------------------------
-    # KONTROLA JAKOŚCI DANYCH
-    # -----------------------------------------------------
 
-    if not quality["ok"]:
-        problems = "\n".join(
-            f"• {problem}"
-            for problem in quality[
-                "problems"
-            ]
+# =========================================================
+# PEŁNY OBRAZ RYNKU
+# =========================================================
+
+def build_full_market_analysis():
+    base = build_market_analysis(
+        "XAUUSD"
+    )
+
+    h4 = fetch_extra_timeframe(
+        "4h"
+    )
+
+    d1 = fetch_extra_timeframe(
+        "1day"
+    )
+
+    return (
+        base
+        + [
+            h4,
+            d1,
+        ]
+    )
+
+
+# =========================================================
+# PROSTY PREFILTER
+# =========================================================
+
+def is_bullish(
+    item,
+):
+    if (
+        not item
+        or "error" in item
+    ):
+        return False
+
+    return (
+        item["price"]
+        > item["ema20"]
+        and item["rsi"] >= 50
+        and item["histogram"] > 0
+    )
+
+
+def is_bearish(
+    item,
+):
+    if (
+        not item
+        or "error" in item
+    ):
+        return False
+
+    return (
+        item["price"]
+        < item["ema20"]
+        and item["rsi"] <= 50
+        and item["histogram"] < 0
+    )
+
+
+def get_by_interval(
+    results,
+):
+    return {
+        item["interval"]: item
+        for item in results
+        if isinstance(
+            item,
+            dict,
+        )
+    }
+
+
+def prefilter_market(
+    results,
+):
+    by_tf = get_by_interval(
+        results
+    )
+
+    h1 = by_tf.get(
+        "1h"
+    )
+
+    m15 = by_tf.get(
+        "15min"
+    )
+
+    m5 = by_tf.get(
+        "5min"
+    )
+
+    m1 = by_tf.get(
+        "1min"
+    )
+
+    if not all(
+        [
+            h1,
+            m15,
+            m5,
+            m1,
+        ]
+    ):
+        return {
+            "candidate": False,
+            "type": "NONE",
+        }
+
+
+    lower_bull = sum(
+        [
+            is_bullish(m15),
+            is_bullish(m5),
+            is_bullish(m1),
+        ]
+    )
+
+    lower_bear = sum(
+        [
+            is_bearish(m15),
+            is_bearish(m5),
+            is_bearish(m1),
+        ]
+    )
+
+
+    # Normalny setup zgodny z H1.
+    if (
+        h1["trend"]
+        == "wzrostowy"
+        and lower_bull >= 2
+    ):
+        return {
+            "candidate": True,
+            "type": "SETUP",
+            "direction": "LONG",
+        }
+
+
+    if (
+        h1["trend"]
+        == "spadkowy"
+        and lower_bear >= 2
+    ):
+        return {
+            "candidate": True,
+            "type": "SETUP",
+            "direction": "SHORT",
+        }
+
+
+    # REVERSAL WATCH:
+    # H1 nadal pokazuje stary trend,
+    # ale niższe TF zaczynają grać przeciwnie.
+    if (
+        h1["trend"]
+        == "spadkowy"
+        and lower_bull >= 2
+    ):
+        return {
+            "candidate": True,
+            "type": "REVERSAL",
+            "direction": "LONG",
+        }
+
+
+    if (
+        h1["trend"]
+        == "wzrostowy"
+        and lower_bear >= 2
+    ):
+        return {
+            "candidate": True,
+            "type": "REVERSAL",
+            "direction": "SHORT",
+        }
+
+
+    return {
+        "candidate": False,
+        "type": "NONE",
+        "direction": "NONE",
+    }
+
+
+# =========================================================
+# PARSOWANIE ODPOWIEDZI AI
+# =========================================================
+
+def parse_ai_meta(
+    answer,
+):
+    upper = answer.upper()
+
+    status = "NONE"
+    direction = "NONE"
+    score = 0
+
+
+    status_match = re.search(
+        r"STATUS\s*=\s*"
+        r"(ENTRY|WAIT|SKIP|"
+        r"REVERSAL|SETUP|NONE)",
+        upper,
+    )
+
+    if status_match:
+        status = (
+            status_match.group(1)
         )
 
-        logger.warning(
-            "Dane nie przeszły kontroli: %s",
-            quality["problems"],
+
+    direction_match = re.search(
+        r"DIRECTION\s*=\s*"
+        r"(LONG|SHORT|NONE)",
+        upper,
+    )
+
+    if direction_match:
+        direction = (
+            direction_match.group(1)
+        )
+
+
+    score_match = re.search(
+        r"SCORE\s*=\s*"
+        r"([0-9]{1,3})",
+        upper,
+    )
+
+    if score_match:
+        try:
+            score = int(
+                score_match.group(1)
+            )
+        except ValueError:
+            score = 0
+
+
+    score = max(
+        0,
+        min(
+            score,
+            100,
+        ),
+    )
+
+
+    display = re.sub(
+        r"^\s*STATUS\s*=\s*"
+        r"[A-Z]+\s*",
+        "",
+        answer,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    display = re.sub(
+        r"^\s*DIRECTION\s*=\s*"
+        r"[A-Z]+\s*",
+        "",
+        display,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    display = re.sub(
+        r"^\s*SCORE\s*=\s*"
+        r"[0-9]{1,3}\s*",
+        "",
+        display,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+    return {
+        "status": status,
+        "direction": direction,
+        "score": score,
+        "message": display,
+    }
+
+
+# =========================================================
+# 5 PYTAŃ BOTA + AI
+# =========================================================
+
+def analyze_market_ai(
+    signal=None,
+    autonomous=False,
+    monitoring=False,
+    prefilter=None,
+):
+    try:
+        full_results = (
+            build_full_market_analysis()
+        )
+
+        base_results = [
+            item
+            for item in full_results
+            if item.get(
+                "interval"
+            )
+            in (
+                "1min",
+                "5min",
+                "15min",
+                "1h",
+            )
+        ]
+
+        quality = validate_market_data(
+            base_results
+        )
+
+    except Exception as error:
+        logger.exception(
+            "Błąd danych rynku: %s",
+            error,
         )
 
         return {
-            "decision": "WAIT",
+            "status": "ERROR",
+            "direction": "NONE",
+            "score": 0,
             "message": (
-                "⚠️ KONTROLA DANYCH\n\n"
-                f"{problems}\n\n"
-                "⏳ CZEKAJ — "
-                "nie potwierdzam wejścia, "
-                "dopóki dane nie będą poprawne."
+                "⚠️ Błąd danych rynkowych."
             ),
         }
+
+
+    if not quality["ok"]:
+        return {
+            "status": "WAIT",
+            "direction": (
+                signal["side"]
+                if signal
+                else "NONE"
+            ),
+            "score": 0,
+            "message": (
+                "⚠️ Dane rynkowe "
+                "nie przeszły kontroli.\n"
+                "Nie potwierdzam wejścia."
+            ),
+        }
+
 
     current_price = quality[
         "current_price"
     ]
 
-    # -----------------------------------------------------
-    # PORÓWNANIE TRADINGVIEW ↔ TWELVE DATA
-    #
-    # Robimy je TYLKO przy pierwszej analizie.
-    # Podczas monitorowania cena ma prawo oddalić się
-    # od pierwotnego sygnału.
-    # -----------------------------------------------------
 
-    strategy_price = signal.get(
-        "strategy_entry"
-    )
-
+    # Cena TradingView kontra Twelve Data.
     if (
-        not monitoring
-        and strategy_price
-        and current_price
+        signal
+        and not monitoring
+        and signal.get(
+            "strategy_entry"
+        )
     ):
-        difference_percent = (
+        strategy_price = signal[
+            "strategy_entry"
+        ]
+
+        diff_percent = (
             abs(
                 current_price
                 - strategy_price
@@ -362,237 +991,256 @@ def analyze_h1_setup(
             * 100
         )
 
-        logger.info(
-            "Porównanie cen: TradingView=%.4f "
-            "TwelveData=%.4f różnica=%.4f%%",
-            strategy_price,
-            current_price,
-            difference_percent,
-        )
-
         if (
-            difference_percent
+            diff_percent
             > MAX_PRICE_DIFF_PERCENT
         ):
             return {
-                "decision": "WAIT",
+                "status": "WAIT",
+                "direction": signal[
+                    "side"
+                ],
+                "score": 0,
                 "message": (
-                    "⚠️ RÓŻNICA CEN\n\n"
+                    "⚠️ Różnica cen.\n\n"
                     f"TradingView: "
                     f"{strategy_price:.2f}\n"
                     f"Twelve Data: "
                     f"{current_price:.2f}\n"
                     f"Różnica: "
-                    f"{difference_percent:.3f}%\n\n"
-                    "⏳ CZEKAJ — "
-                    "ceny wymagają ponownego "
-                    "sprawdzenia."
+                    f"{diff_percent:.3f}%\n\n"
+                    "⏳ CZEKAJ."
                 ),
             }
 
-    # -----------------------------------------------------
-    # FORMAT DANYCH DLA AI
-    # -----------------------------------------------------
 
     market_data = format_market_data(
-        market_results
+        full_results
     )
 
-    if monitoring:
-        mode = (
-            "To jest PONOWNA analiza "
-            "wcześniej aktywnego setupu. "
-            "Sprawdź, czy warunki do wejścia "
-            "są dobre TERAZ."
+
+    if autonomous:
+        source_text = (
+            "To jest AUTOMATYCZNY SKAN rynku. "
+            "Nie ma sygnału TradingView."
+        )
+
+        direction_text = (
+            prefilter.get(
+                "direction",
+                "NONE",
+            )
+            if prefilter
+            else "NONE"
+        )
+
+        candidate_text = (
+            prefilter.get(
+                "type",
+                "NONE",
+            )
+            if prefilter
+            else "NONE"
         )
 
     else:
-        mode = (
-            "To jest PIERWSZA analiza "
-            "nowego sygnału H1."
+        source_text = (
+            "To jest analiza sygnału "
+            "ze strategii TradingView."
         )
 
+        direction_text = (
+            signal["side"]
+            if signal
+            else "NONE"
+        )
+
+        candidate_text = (
+            "STRATEGY_SIGNAL"
+        )
+
+
     prompt = f"""
-{mode}
+{source_text}
 
-SYGNAŁ Z TRADINGVIEW
+KANDYDAT:
+{candidate_text}
 
-Instrument:
-{signal["symbol"]}
+KIERUNEK BAZOWY:
+{direction_text}
 
-Timeframe:
-{signal["timeframe"]}
-
-Kierunek strategii:
-{signal["side"]}
-
-Cena strategii:
-{signal["strategy_entry"]}
-
-SL strategii:
-{signal["strategy_sl"]}
-
-TP strategii:
-{signal["strategy_tp"]}
-
-
-AKTUALNA CENA TWELVE DATA:
-
+AKTUALNA CENA:
 {current_price}
 
 
-AKTUALNE DANE TECHNICZNE:
+DANE RYNKOWE:
 
 {market_data}
 
 
-ZADANIE:
+ZASTOSUJ 5 PYTAŃ BOTA:
 
-H1 jest głównym kierunkiem.
+1. Czy handlujemy zgodnie
+z większym trendem D1/H4?
 
-15m służy do oceny struktury.
+2. Czy cena znajduje się
+przy ważnym poziomie,
+wsparciu, oporze,
+poprzednim szczycie/dołku
+lub strefie reakcji?
 
-5m służy do oceny momentum.
+3. Czy wystąpiło prawdziwe
+potwierdzenie na H1/15m/5m/1m?
 
-1m służy do timingu wejścia.
+4. Czy zachowanie ceny pasuje
+do kierunku, którego oczekujemy?
 
-TradingView daje tylko kierunek bazowy.
+5. Jeśli nie, czy setup należy
+unieważnić?
 
-Sam oceń, czy wejście ma sens teraz.
 
-Nie musisz kopiować ceny wejścia,
-SL ani TP strategii.
+WAŻNE:
 
-Jeżeli setup jest dobry,
-zaproponuj własne poziomy.
+Jeżeli H1 nadal pokazuje stary trend,
+ale 15m i 5m zaczynają tworzyć
+wyraźną zmianę struktury,
+nie ignoruj tego.
 
-Jeżeli jeszcze za wcześnie,
-wybierz CZEKAJ.
+Możesz wtedy użyć:
+REVERSAL
 
-Jeżeli setup się zepsuł,
-wybierz POMIN.
+To oznacza:
+rynek nie dał jeszcze pełnego wejścia,
+ale pojawia się realna możliwość
+zmiany kierunku.
 """
+
 
     instructions = """
 Odpowiadaj po polsku.
 
-Jesteś Trading AI Analyzer.
+Jesteś Trading AI Analyzer v2.
 
-Analizujesz XAUUSD.
+Nie próbujesz przewidywać rynku
+za wszelką cenę.
 
-Masz aktualne dane:
-1m,
-5m,
-15m,
-1h.
+Masz ocenić jakość setupu
+i zachowanie ceny.
 
-1h = główny kierunek.
-15m = struktura.
-5m = momentum.
-1m = timing.
+Interwały:
 
-Uwzględniaj:
-EMA20,
-EMA50,
-RSI,
-MACD,
-histogram MACD,
-wsparcie,
-opór,
-aktualną cenę.
+D1 = szeroki kontekst
+H4 = większa struktura
+H1 = główny setup
+15m = struktura krótkoterminowa
+5m = momentum
+1m = timing
 
-TradingView daje sygnał bazowy
-LONG albo SHORT.
+D1 i H4 NIE są twardą blokadą.
+Są kontekstem i wpływają na ryzyko.
 
-Nie kopiuj bezmyślnie poziomów
-ze strategii TradingView.
+Jeżeli H1 jest jeszcze spadkowe,
+ale 15m/5m wyraźnie zmieniają
+strukturę wzrostowo,
+możesz zwrócić REVERSAL LONG.
 
-Wybierz dokładnie jedną decyzję:
+Analogicznie w drugą stronę.
 
-WEJSCIE
+Nie wymagaj idealnej zgodności
+wszystkich interwałów.
 
-gdy warunki wystarczająco
-potwierdzają wejście teraz.
+Nie dawaj wejścia tylko dlatego,
+że jeden wskaźnik zmienił kierunek.
 
-CZEKAJ
+Szukaj:
+- ważnego poziomu,
+- zmiany zachowania ceny,
+- struktury,
+- momentum,
+- potwierdzenia,
+- sensownego risk/reward.
 
-gdy setup nadal ma sens,
-ale timing nie jest jeszcze dobry.
+Wybierz dokładnie jeden STATUS:
 
-POMIN
+ENTRY
+gdy wejście ma sens TERAZ.
 
-gdy setup stracił sens,
-interwały wyraźnie przeczą kierunkowi
-albo risk/reward jest niekorzystny.
+WAIT
+gdy pomysł jest sensowny,
+ale timing jest za słaby.
 
-Jeżeli decyzja to WEJSCIE albo CZEKAJ:
+REVERSAL
+gdy możliwe jest odwrócenie,
+ale jeszcze nie ma pełnego wejścia.
 
-podaj:
-- własną cenę lub wąską strefę wejścia,
-- SL,
-- TP1,
-- TP2,
-- TP3.
+SETUP
+gdy istnieje ciekawy setup
+do obserwacji.
 
-SL powinien znajdować się
-za logicznym poziomem unieważnienia.
+SKIP
+gdy setup jest słaby
+lub został unieważniony.
 
-TP powinny wynikać
-ze wsparć, oporów i struktury rynku.
-
-Nie wymyślaj danych.
-
-Jeżeli układ jest niejasny,
-wybierz CZEKAJ.
+NONE
+gdy nie ma nic wartego uwagi.
 
 
-PIERWSZA LINIA MUSI BYĆ:
+Pierwsze 3 linie MUSZĄ być:
 
-DECYZJA=WEJSCIE
+STATUS=ENTRY
+DIRECTION=LONG
+SCORE=82
 
-albo:
+Oczywiście wartości dopasuj
+do swojej decyzji.
 
-DECYZJA=CZEKAJ
+SCORE od 0 do 100 oznacza
+jakość setupu.
 
-albo:
+Następnie odpowiedz krótko:
 
-DECYZJA=POMIN
+📊 XAUUSD
 
+Cena: ...
 
-Dalej użyj formatu:
+Status: ...
 
-🟢 XAUUSD LONG — H1
-albo
-🔴 XAUUSD SHORT — H1
+Kierunek: ...
 
-Cena teraz: [cena]
+Score: .../100
 
-Decyzja: [✅ WEJŚCIE / ⏳ CZEKAJ / ❌ POMIŃ]
+D1: ...
+H4: ...
+H1: ...
+15m: ...
+5m: ...
+1m: ...
 
-Wejście AI: [cena / strefa / -]
-SL: [cena / -]
-TP1: [cena / -]
-TP2: [cena / -]
-TP3: [cena / -]
+Ważny poziom:
+...
 
-1m: [✅ / ⚠️ / ❌]
-5m: [✅ / ⚠️ / ❌]
-15m: [✅ / ⚠️ / ❌]
-1h: [✅ / ⚠️ / ❌]
+Potwierdzenie:
+...
 
 Warunek wejścia:
-[jedno krótkie zdanie]
+...
 
 Unieważnienie:
-[jedno krótkie zdanie]
+...
 
-Nie pisz długiego komentarza.
+Jeśli STATUS=ENTRY,
+podaj dodatkowo:
+
+Wejście AI: ...
+SL: ...
+TP1: ...
+TP2: ...
+TP3: ...
+
 Nie gwarantuj zysku.
+Nie pisz długiego komentarza.
 """
 
-    # -----------------------------------------------------
-    # OPENAI
-    # -----------------------------------------------------
 
     try:
         response = client.responses.create(
@@ -613,53 +1261,311 @@ Nie gwarantuj zysku.
         )
 
         return {
-            "decision": "ERROR",
+            "status": "ERROR",
+            "direction": "NONE",
+            "score": 0,
             "message": (
-                "⚠️ XAUUSD\n"
-                "Wystąpił błąd "
-                "podczas analizy AI."
+                "⚠️ Błąd analizy AI."
             ),
         }
 
-    # -----------------------------------------------------
-    # ODCZYT DECYZJI
-    # -----------------------------------------------------
 
-    upper = answer.upper()
-
-    if "DECYZJA=WEJSCIE" in upper:
-        decision = "ENTRY"
-
-    elif "DECYZJA=CZEKAJ" in upper:
-        decision = "WAIT"
-
-    elif "DECYZJA=POMIN" in upper:
-        decision = "SKIP"
-
-    else:
-        decision = "UNKNOWN"
-
-    # Usuwamy techniczną linię DECYZJA=...
-    display_answer = re.sub(
-        r"^\s*DECYZJA\s*=\s*"
-        r"[A-ZĄĆĘŁŃÓŚŹŻ]+\s*",
-        "",
-        answer,
-        count=1,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    return {
-        "decision": decision,
-        "message": display_answer,
-    }
+    return parse_ai_meta(
+        answer
+    )
 
 
 # =========================================================
-# MONITOROWANIE SETUPU
+# FORMAT ALERTÓW AUTO
 # =========================================================
 
-def monitor_setup(
+def auto_alert_text(
+    result,
+):
+    status = result[
+        "status"
+    ]
+
+    message = result[
+        "message"
+    ]
+
+    if status == "REVERSAL":
+        return (
+            "🔄 REVERSAL WATCH\n\n"
+            + message
+        )
+
+    if status == "SETUP":
+        return (
+            "📡 SETUP WYKRYTY\n\n"
+            + message
+        )
+
+    if status == "ENTRY":
+        return (
+            "🚨 WEJŚCIE POTWIERDZONE\n\n"
+            + message
+        )
+
+    if status == "SKIP":
+        return (
+            "❌ SETUP UNIEWAŻNIONY\n\n"
+            + message
+        )
+
+    return None
+
+
+# =========================================================
+# CZY WYSŁAĆ AUTO ALERT
+# =========================================================
+
+def should_send_auto_alert(
+    result,
+):
+    status = result[
+        "status"
+    ]
+
+    direction = result[
+        "direction"
+    ]
+
+    score = result[
+        "score"
+    ]
+
+
+    if status not in (
+        "SETUP",
+        "REVERSAL",
+        "ENTRY",
+        "SKIP",
+    ):
+        return False
+
+
+    # Nie pokazujemy słabych
+    # setupów obserwacyjnych.
+    if (
+        status in (
+            "SETUP",
+            "REVERSAL",
+        )
+        and score < 60
+    ):
+        return False
+
+
+    key = (
+        f"{status}|"
+        f"{direction}|"
+        f"{score // 10}"
+    )
+
+    now = time.time()
+
+
+    with auto_lock:
+        same = (
+            auto_state[
+                "last_key"
+            ]
+            == key
+        )
+
+        elapsed = (
+            now
+            - auto_state[
+                "last_sent_at"
+            ]
+        )
+
+        if (
+            same
+            and elapsed
+            < AUTO_ALERT_COOLDOWN_SECONDS
+        ):
+            return False
+
+
+        auto_state[
+            "last_key"
+        ] = key
+
+        auto_state[
+            "last_sent_at"
+        ] = now
+
+        auto_state[
+            "last_status"
+        ] = status
+
+        auto_state[
+            "last_direction"
+        ] = direction
+
+
+    return True
+
+
+# =========================================================
+# AUTOMATYCZNY SKAN
+# =========================================================
+
+def auto_scan_once():
+    try:
+        results = (
+            build_full_market_analysis()
+        )
+
+        candidate = prefilter_market(
+            results
+        )
+
+
+        if not candidate[
+            "candidate"
+        ]:
+            logger.info(
+                "AUTO SCAN: brak kandydata."
+            )
+            return
+
+
+        logger.info(
+            "AUTO SCAN: kandydat %s %s",
+            candidate.get(
+                "type"
+            ),
+            candidate.get(
+                "direction"
+            ),
+        )
+
+
+        result = analyze_market_ai(
+            autonomous=True,
+            prefilter=candidate,
+        )
+
+
+        logger.info(
+            "AUTO SCAN AI: %s %s score=%s",
+            result["status"],
+            result["direction"],
+            result["score"],
+        )
+
+
+        if should_send_auto_alert(
+            result
+        ):
+            text = auto_alert_text(
+                result
+            )
+
+            if text:
+                send_telegram_message(
+                    text
+                )
+
+
+    except Exception as error:
+        logger.exception(
+            "Błąd auto scan: %s",
+            error,
+        )
+
+
+def auto_scanner_loop():
+    logger.info(
+        "AUTO SCANNER uruchomiony."
+    )
+
+    # Pierwszy skan chwilę po starcie.
+    time.sleep(
+        20
+    )
+
+    while True:
+        auto_scan_once()
+
+        time.sleep(
+            AUTO_SCAN_INTERVAL_SECONDS
+        )
+
+
+# =========================================================
+# BLOKADA JEDNEGO SCANNERA
+# =========================================================
+
+def acquire_scanner_lock():
+    global scanner_lock_file
+
+    if fcntl is None:
+        return True
+
+    try:
+        scanner_lock_file = open(
+            "/tmp/trading_ai_scanner.lock",
+            "w",
+        )
+
+        fcntl.flock(
+            scanner_lock_file,
+            (
+                fcntl.LOCK_EX
+                | fcntl.LOCK_NB
+            ),
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+def start_auto_scanner():
+    global scanner_started
+
+    if not AUTO_SCAN_ENABLED:
+        logger.info(
+            "AUTO SCANNER wyłączony."
+        )
+        return
+
+
+    with scanner_start_lock:
+        if scanner_started:
+            return
+
+
+        if not acquire_scanner_lock():
+            logger.info(
+                "AUTO SCANNER działa już "
+                "w innym workerze."
+            )
+            return
+
+
+        scanner_started = True
+
+
+        thread = threading.Thread(
+            target=auto_scanner_loop,
+            daemon=True,
+        )
+
+        thread.start()
+
+
+# =========================================================
+# MONITOR STRATEGII
+# =========================================================
+
+def monitor_strategy_setup(
     signal,
     monitor_id,
 ):
@@ -667,11 +1573,6 @@ def monitor_setup(
         "symbol"
     ]
 
-    logger.info(
-        "Start monitorowania %s | ID=%s",
-        symbol,
-        monitor_id,
-    )
 
     for check_number in range(
         1,
@@ -681,210 +1582,146 @@ def monitor_setup(
             MONITOR_INTERVAL_SECONDS
         )
 
-        # -------------------------------------------------
-        # CZY MONITOR NADAL JEST AKTYWNY
-        # -------------------------------------------------
 
         with monitor_lock:
-            active = active_monitors.get(
+            current = active_monitors.get(
                 symbol
             )
 
             if (
-                not active
-                or active.get("id")
+                not current
+                or current.get(
+                    "id"
+                )
                 != monitor_id
             ):
-                logger.info(
-                    "Monitor %s "
-                    "został zastąpiony.",
-                    monitor_id,
-                )
                 return
 
+
         logger.info(
-            "Ponowna analiza %s/%s | %s",
+            "Monitor strategii %s/%s",
             check_number,
             MONITOR_MAX_CHECKS,
-            symbol,
         )
 
-        # -------------------------------------------------
-        # PONOWNA ANALIZA
-        # -------------------------------------------------
 
-        result = analyze_h1_setup(
-            signal,
+        result = analyze_market_ai(
+            signal=signal,
             monitoring=True,
         )
 
-        decision = result[
-            "decision"
+
+        status = result[
+            "status"
         ]
 
-        # -------------------------------------------------
-        # WEJŚCIE
-        # -------------------------------------------------
 
-        if decision == "ENTRY":
+        if status == "ENTRY":
             send_telegram_message(
-                "🚨 WEJŚCIE POTWIERDZONE\n\n"
+                "🚨 WEJŚCIE POTWIERDZONE "
+                "DLA SYGNAŁU STRATEGII\n\n"
                 + result["message"]
             )
 
             with monitor_lock:
-                current = active_monitors.get(
-                    symbol
+                active_monitors.pop(
+                    symbol,
+                    None,
                 )
-
-                if (
-                    current
-                    and current.get("id")
-                    == monitor_id
-                ):
-                    active_monitors.pop(
-                        symbol,
-                        None,
-                    )
-
-            logger.info(
-                "Setup potwierdzony: %s",
-                monitor_id,
-            )
 
             return
 
-        # -------------------------------------------------
-        # SETUP ANULOWANY
-        # -------------------------------------------------
 
-        if decision == "SKIP":
+        if status == "SKIP":
             send_telegram_message(
-                "❌ SETUP UNIEWAŻNIONY\n\n"
+                "❌ SYGNAŁ STRATEGII "
+                "UNIEWAŻNIONY\n\n"
                 + result["message"]
             )
 
             with monitor_lock:
-                current = active_monitors.get(
-                    symbol
+                active_monitors.pop(
+                    symbol,
+                    None,
                 )
-
-                if (
-                    current
-                    and current.get("id")
-                    == monitor_id
-                ):
-                    active_monitors.pop(
-                        symbol,
-                        None,
-                    )
-
-            logger.info(
-                "Setup anulowany: %s",
-                monitor_id,
-            )
 
             return
 
-        # WAIT / ERROR / UNKNOWN
-        # nic nie wysyłamy.
-        # Dalej obserwujemy.
 
-    # -----------------------------------------------------
-    # KONIEC CZASU OBSERWACJI
-    # -----------------------------------------------------
+        if status == "REVERSAL":
+            send_telegram_message(
+                "🔄 REVERSAL WATCH "
+                "PODCZAS MONITOROWANIA\n\n"
+                + result["message"]
+            )
+
 
     with monitor_lock:
-        current = active_monitors.get(
-            symbol
+        active_monitors.pop(
+            symbol,
+            None,
         )
 
-        if (
-            current
-            and current.get("id")
-            == monitor_id
-        ):
-            active_monitors.pop(
-                symbol,
-                None,
-            )
 
     send_telegram_message(
-        "⌛ XAUUSD — OBSERWACJA ZAKOŃCZONA\n\n"
-        "Setup nie uzyskał wystarczającego "
-        "potwierdzenia w czasie obserwacji."
+        "⌛ OBSERWACJA SYGNAŁU "
+        "ZAKOŃCZONA\n\n"
+        "Setup nie uzyskał "
+        "wystarczającego potwierdzenia."
     )
 
 
 # =========================================================
-# OBSŁUGA ALERTU TRADINGVIEW
+# ALERT STRATEGII
 # =========================================================
 
 def process_alert(text):
-    logger.info(
-        "ODEBRANO TRADINGVIEW:\n%s",
-        text,
-    )
-
     signal = parse_alert(
         text
     )
 
     logger.info(
-        "Rozpoznany sygnał: %s",
+        "TradingView: %s",
         signal,
     )
 
-    # -----------------------------------------------------
-    # IGNORUJEMY TP / SL / INNE ALERTY
-    # -----------------------------------------------------
 
-    if signal["event"] != "ENTRY":
-        logger.info(
-            "Alert pominięty: %s",
-            signal["event"],
-        )
+    if signal[
+        "event"
+    ] != "ENTRY":
         return
 
-    # -----------------------------------------------------
-    # TYLKO XAUUSD
-    # -----------------------------------------------------
 
-    if signal["symbol"] != "XAUUSD":
-        logger.info(
-            "Instrument pominięty: %s",
-            signal["symbol"],
-        )
+    if signal[
+        "symbol"
+    ] != "XAUUSD":
         return
 
-    # -----------------------------------------------------
-    # TYLKO H1
-    # -----------------------------------------------------
 
     timeframe = str(
-        signal["timeframe"]
+        signal[
+            "timeframe"
+        ]
     ).lower()
+
 
     if timeframe not in (
         "1h",
         "60",
         "60m",
     ):
-        logger.info(
-            "Pominięto sygnał spoza H1: %s",
-            timeframe,
-        )
         return
 
-    # -----------------------------------------------------
-    # INFORMACJA, ŻE STRATEGIA DAŁA SYGNAŁ
-    # -----------------------------------------------------
 
     side_icon = (
         "🟢"
-        if signal["side"] == "LONG"
+        if signal[
+            "side"
+        ]
+        == "LONG"
         else "🔴"
     )
+
 
     send_telegram_message(
         f"📡 STRATEGIA H1 — "
@@ -893,163 +1730,114 @@ def process_alert(text):
         f"{signal['side']}\n"
         f"Cena sygnału: "
         f"{signal['strategy_entry']}\n\n"
-        "🤖 Sprawdzam zgodność ceny "
-        "TradingView z Twelve Data "
-        "oraz 1h / 15m / 5m / 1m."
+        "🤖 Bot v2 analizuje:\n"
+        "D1 / H4 / H1 / 15m / 5m / 1m\n"
+        "+ 5 pytań bota."
     )
 
-    # -----------------------------------------------------
-    # PIERWSZA ANALIZA
-    # -----------------------------------------------------
 
-    result = analyze_h1_setup(
-        signal,
+    result = analyze_market_ai(
+        signal=signal,
         monitoring=False,
     )
 
-    decision = result[
-        "decision"
+
+    status = result[
+        "status"
     ]
 
-    # -----------------------------------------------------
-    # WEJŚCIE OD RAZU
-    # -----------------------------------------------------
 
-    if decision == "ENTRY":
+    if status == "ENTRY":
         send_telegram_message(
             "🚨 WEJŚCIE POTWIERDZONE\n\n"
             + result["message"]
         )
-
-        with monitor_lock:
-            active_monitors.pop(
-                signal["symbol"],
-                None,
-            )
-
         return
 
-    # -----------------------------------------------------
-    # SETUP ODRZUCONY
-    # -----------------------------------------------------
 
-    if decision == "SKIP":
+    if status == "SKIP":
         send_telegram_message(
             "❌ SETUP ODRZUCONY\n\n"
             + result["message"]
         )
-
-        with monitor_lock:
-            active_monitors.pop(
-                signal["symbol"],
-                None,
-            )
-
         return
 
-    # -----------------------------------------------------
-    # CZEKAJ
-    # -----------------------------------------------------
 
-    if decision == "WAIT":
+    if status == "REVERSAL":
         send_telegram_message(
-            "⏳ AI CZEKA — "
-            "SETUP OBSERWOWANY\n\n"
+            "🔄 REVERSAL WATCH\n\n"
             + result["message"]
-            + "\n\n"
-            "🔄 Bot sprawdzi rynek "
-            "ponownie co 5 minut."
         )
 
-        monitor_id = str(
-            uuid.uuid4()
-        )
 
-        with monitor_lock:
-            active_monitors[
-                signal["symbol"]
-            ] = {
-                "id": monitor_id,
-                "side": signal["side"],
-                "started": time.time(),
-            }
-
-        monitor_thread = threading.Thread(
-            target=monitor_setup,
-            args=(
-                signal,
-                monitor_id,
-            ),
-            daemon=True,
-        )
-
-        monitor_thread.start()
-
-        logger.info(
-            "Uruchomiono monitor %s",
-            monitor_id,
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # BŁĄD
-    # -----------------------------------------------------
-
-    if decision == "ERROR":
+    else:
         send_telegram_message(
-            result["message"]
+            "⏳ SETUP OBSERWOWANY\n\n"
+            + result["message"]
         )
-        return
 
-    # -----------------------------------------------------
-    # NIEJEDNOZNACZNA DECYZJA
-    # -----------------------------------------------------
 
-    send_telegram_message(
-        "⚠️ AI NIE ROZPOZNAŁO "
-        "JEDNOZNACZNEJ DECYZJI\n\n"
-        + result["message"]
+    monitor_id = str(
+        uuid.uuid4()
     )
 
 
+    with monitor_lock:
+        active_monitors[
+            signal["symbol"]
+        ] = {
+            "id": monitor_id,
+            "side": signal[
+                "side"
+            ],
+            "started": time.time(),
+        }
+
+
+    thread = threading.Thread(
+        target=monitor_strategy_setup,
+        args=(
+            signal,
+            monitor_id,
+        ),
+        daemon=True,
+    )
+
+    thread.start()
+
+
 # =========================================================
-# WEB SERVER
+# FLASK
 # =========================================================
 
 @app.route(
     "/",
-    methods=["GET"],
+    methods=[
+        "GET",
+    ],
 )
 def home():
-    with monitor_lock:
-        monitors = dict(
-            active_monitors
-        )
-
     return jsonify(
         {
             "status": "ok",
             "service": (
-                "Trading AI Analyzer Webhook"
+                "Trading AI Analyzer v2"
             ),
-            "monitor_interval_seconds": (
-                MONITOR_INTERVAL_SECONDS
+            "auto_scan_enabled": (
+                AUTO_SCAN_ENABLED
             ),
-            "monitor_max_checks": (
-                MONITOR_MAX_CHECKS
+            "auto_scan_interval": (
+                AUTO_SCAN_INTERVAL_SECONDS
             ),
-            "max_price_diff_percent": (
-                MAX_PRICE_DIFF_PERCENT
-            ),
-            "active_monitors": monitors,
         }
     )
 
 
 @app.route(
     "/health",
-    methods=["GET"],
+    methods=[
+        "GET",
+    ],
 )
 def health():
     with monitor_lock:
@@ -1061,19 +1849,20 @@ def health():
         {
             "status": "healthy",
             "active_monitors": monitors,
+            "auto_scanner": (
+                scanner_started
+            ),
         }
     )
 
 
 @app.route(
     "/webhook",
-    methods=["POST"],
+    methods=[
+        "POST",
+    ],
 )
 def webhook():
-    # -----------------------------------------------------
-    # SECRET
-    # -----------------------------------------------------
-
     secret = request.args.get(
         "secret"
     )
@@ -1085,9 +1874,6 @@ def webhook():
             }
         ), 403
 
-    # -----------------------------------------------------
-    # ODCZYT WIADOMOŚCI
-    # -----------------------------------------------------
 
     try:
         if request.is_json:
@@ -1100,22 +1886,31 @@ def webhook():
                 dict,
             ):
                 text = (
-                    data.get("message")
-                    or data.get("text")
-                    or json.dumps(data)
+                    data.get(
+                        "message"
+                    )
+                    or data.get(
+                        "text"
+                    )
+                    or json.dumps(
+                        data
+                    )
                 )
 
             else:
-                text = str(data)
+                text = str(
+                    data
+                )
 
         else:
             text = request.get_data(
                 as_text=True
             )
 
+
     except Exception as error:
         logger.exception(
-            "Błąd odczytu webhooka: %s",
+            "Błąd webhooka: %s",
             error,
         )
 
@@ -1125,6 +1920,7 @@ def webhook():
             }
         ), 400
 
+
     if not text or not text.strip():
         return jsonify(
             {
@@ -1132,19 +1928,18 @@ def webhook():
             }
         ), 400
 
-    # -----------------------------------------------------
-    # ANALIZA W TLE
-    # -----------------------------------------------------
 
     thread = threading.Thread(
         target=process_alert,
-        args=(text,),
+        args=(
+            text,
+        ),
         daemon=True,
     )
 
     thread.start()
 
-    # TradingView dostaje odpowiedź natychmiast.
+
     return jsonify(
         {
             "status": "accepted",
@@ -1153,7 +1948,14 @@ def webhook():
 
 
 # =========================================================
-# LOCAL START
+# START SCANNERA
+# =========================================================
+
+start_auto_scanner()
+
+
+# =========================================================
+# LOCAL
 # =========================================================
 
 if __name__ == "__main__":
