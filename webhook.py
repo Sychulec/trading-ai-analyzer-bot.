@@ -7,6 +7,7 @@ import logging
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 
 try:
     import fcntl
@@ -73,7 +74,7 @@ client = OpenAI(
 # USTAWIENIA
 # =========================================================
 
-# Monitoring sygnału strategii.
+# Monitoring sygnału TradingView.
 MONITOR_INTERVAL_SECONDS = int(
     os.getenv(
         "MONITOR_INTERVAL_SECONDS",
@@ -88,7 +89,7 @@ MONITOR_MAX_CHECKS = int(
     )
 )
 
-# Automatyczny skaner rynku.
+# Automatyczny skaner.
 AUTO_SCAN_ENABLED = (
     os.getenv(
         "AUTO_SCAN_ENABLED",
@@ -97,14 +98,16 @@ AUTO_SCAN_ENABLED = (
     == "true"
 )
 
+# Na początek 10 minut zamiast 5.
+# Dzięki temu dużo trudniej uderzyć w limit Twelve Data.
 AUTO_SCAN_INTERVAL_SECONDS = int(
     os.getenv(
         "AUTO_SCAN_INTERVAL_SECONDS",
-        "300",
+        "600",
     )
 )
 
-# Ile czasu nie powtarzać identycznego alertu.
+# Nie powtarzaj identycznego alertu zbyt szybko.
 AUTO_ALERT_COOLDOWN_SECONDS = int(
     os.getenv(
         "AUTO_ALERT_COOLDOWN_SECONDS",
@@ -119,6 +122,38 @@ MAX_PRICE_DIFF_PERCENT = float(
     )
 )
 
+# Cache podstawowych danych 1m/5m/15m/H1.
+BASE_CACHE_SECONDS = int(
+    os.getenv(
+        "BASE_CACHE_SECONDS",
+        "90",
+    )
+)
+
+# H4 wystarczy odświeżać znacznie rzadziej.
+H4_CACHE_SECONDS = int(
+    os.getenv(
+        "H4_CACHE_SECONDS",
+        "1800",
+    )
+)
+
+# D1 nie ma sensu pobierać co kilka minut.
+D1_CACHE_SECONDS = int(
+    os.getenv(
+        "D1_CACHE_SECONDS",
+        "14400",
+    )
+)
+
+# Po Twelve Data 429 blokujemy nowe pobrania.
+RATE_LIMIT_BACKOFF_SECONDS = int(
+    os.getenv(
+        "RATE_LIMIT_BACKOFF_SECONDS",
+        "300",
+    )
+)
+
 
 # =========================================================
 # STAN
@@ -126,6 +161,9 @@ MAX_PRICE_DIFF_PERCENT = float(
 
 monitor_lock = threading.Lock()
 auto_lock = threading.Lock()
+
+market_cache_lock = threading.Lock()
+market_fetch_lock = threading.Lock()
 
 active_monitors = {}
 
@@ -138,8 +176,27 @@ auto_state = {
 
 scanner_started = False
 scanner_start_lock = threading.Lock()
-
 scanner_lock_file = None
+
+
+market_cache = {
+    "base": {
+        "data": None,
+        "timestamp": 0,
+    },
+
+    "4h": {
+        "data": None,
+        "timestamp": 0,
+    },
+
+    "1day": {
+        "data": None,
+        "timestamp": 0,
+    },
+}
+
+rate_limit_until = 0
 
 
 # =========================================================
@@ -152,14 +209,8 @@ def send_telegram_message(text):
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    for i in range(
-        0,
-        len(text),
-        4000,
-    ):
-        chunk = text[
-            i:i + 4000
-        ]
+    for i in range(0, len(text), 4000):
+        chunk = text[i:i + 4000]
 
         data = urllib.parse.urlencode(
             {
@@ -189,13 +240,35 @@ def send_telegram_message(text):
 
 
 # =========================================================
+# RATE LIMIT TWELVE DATA
+# =========================================================
+
+def rate_limit_active():
+    global rate_limit_until
+
+    return time.time() < rate_limit_until
+
+
+def activate_rate_limit_backoff():
+    global rate_limit_until
+
+    rate_limit_until = (
+        time.time()
+        + RATE_LIMIT_BACKOFF_SECONDS
+    )
+
+    logger.warning(
+        "TWELVE DATA 429. "
+        "Pauza na %s sekund.",
+        RATE_LIMIT_BACKOFF_SECONDS,
+    )
+
+
+# =========================================================
 # ALERT TRADINGVIEW
 # =========================================================
 
-def extract_number(
-    pattern,
-    text,
-):
+def extract_number(pattern, text):
     match = re.search(
         pattern,
         text,
@@ -291,19 +364,14 @@ def parse_alert(text):
 
 
 # =========================================================
-# WSKAŹNIKI DLA H4 / D1
+# WSKAŹNIKI
 # =========================================================
 
-def ema_series(
-    values,
-    period,
-):
+def ema_series(values, period):
     if not values:
         return []
 
-    multiplier = (
-        2 / (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
     result = [
         values[0]
@@ -339,32 +407,24 @@ def calculate_rsi(
         )
 
         gains.append(
-            max(
-                change,
-                0,
-            )
+            max(change, 0)
         )
 
         losses.append(
-            max(
-                -change,
-                0,
-            )
+            max(-change, 0)
         )
 
+
     avg_gain = (
-        sum(
-            gains[:period]
-        )
+        sum(gains[:period])
         / period
     )
 
     avg_loss = (
-        sum(
-            losses[:period]
-        )
+        sum(losses[:period])
         / period
     )
+
 
     for i in range(
         period,
@@ -382,13 +442,11 @@ def calculate_rsi(
             + losses[i]
         ) / period
 
+
     if avg_loss == 0:
         return 100.0
 
-    rs = (
-        avg_gain
-        / avg_loss
-    )
+    rs = avg_gain / avg_loss
 
     return (
         100
@@ -399,9 +457,7 @@ def calculate_rsi(
     )
 
 
-def calculate_macd(
-    closes,
-):
+def calculate_macd(closes):
     if len(closes) < 35:
         return (
             None,
@@ -421,7 +477,8 @@ def calculate_macd(
 
     macd_line = [
         a - b
-        for a, b in zip(
+        for a, b
+        in zip(
             ema12,
             ema26,
         )
@@ -443,13 +500,23 @@ def calculate_macd(
 
 
 # =========================================================
-# TWELVE DATA H4 / D1
+# H4 / D1 Z CACHE
 # =========================================================
 
-def fetch_extra_timeframe(
+def fetch_extra_timeframe_raw(
     interval,
     outputsize=120,
 ):
+    if rate_limit_active():
+        return {
+            "interval": interval,
+            "error": (
+                "Twelve Data rate-limit "
+                "backoff aktywny"
+            ),
+        }
+
+
     params = urllib.parse.urlencode(
         {
             "symbol": "XAU/USD",
@@ -464,33 +531,81 @@ def fetch_extra_timeframe(
         f"time_series?{params}"
     )
 
+
     try:
         with urllib.request.urlopen(
             url,
             timeout=15,
         ) as response:
+
             data = json.loads(
                 response.read().decode(
                     "utf-8"
                 )
             )
 
-        if "values" not in data:
+
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            activate_rate_limit_backoff()
+
             return {
                 "interval": interval,
                 "error": (
-                    data.get(
-                        "message",
-                        "Brak danych",
-                    )
+                    "HTTP 429 "
+                    "Too Many Requests"
                 ),
             }
 
-        candles = []
+        logger.exception(
+            "HTTP error %s dla %s",
+            error.code,
+            interval,
+        )
 
-        for item in reversed(
-            data["values"]
+        return {
+            "interval": interval,
+            "error": str(error),
+        }
+
+
+    except Exception as error:
+        logger.exception(
+            "Błąd dodatkowego TF %s: %s",
+            interval,
+            error,
+        )
+
+        return {
+            "interval": interval,
+            "error": str(error),
+        }
+
+
+    if "values" not in data:
+        message = data.get(
+            "message",
+            "Brak danych",
+        )
+
+        if (
+            "limit" in message.lower()
+            or "credits" in message.lower()
         ):
+            activate_rate_limit_backoff()
+
+        return {
+            "interval": interval,
+            "error": message,
+        }
+
+
+    candles = []
+
+    for item in reversed(
+        data["values"]
+    ):
+        try:
             candles.append(
                 {
                     "datetime": item[
@@ -511,124 +626,317 @@ def fetch_extra_timeframe(
                 }
             )
 
-        if len(candles) < 55:
-            return {
-                "interval": interval,
-                "error": (
-                    "Za mało danych"
-                ),
-            }
+        except Exception:
+            continue
 
-        closes = [
-            candle["close"]
-            for candle in candles
-        ]
 
-        latest = candles[-1]
-
-        ema20 = ema_series(
-            closes,
-            20,
-        )[-1]
-
-        ema50 = ema_series(
-            closes,
-            50,
-        )[-1]
-
-        rsi = calculate_rsi(
-            closes
-        )
-
-        (
-            macd,
-            signal,
-            histogram,
-        ) = calculate_macd(
-            closes
-        )
-
-        recent = candles[-30:]
-
-        support = min(
-            candle["low"]
-            for candle in recent
-        )
-
-        resistance = max(
-            candle["high"]
-            for candle in recent
-        )
-
-        if ema20 > ema50:
-            trend = "wzrostowy"
-
-        elif ema20 < ema50:
-            trend = "spadkowy"
-
-        else:
-            trend = "neutralny"
-
+    if len(candles) < 55:
         return {
             "interval": interval,
-            "datetime": latest[
-                "datetime"
-            ],
-            "price": latest[
-                "close"
-            ],
-            "open": latest[
-                "open"
-            ],
-            "high": latest[
-                "high"
-            ],
-            "low": latest[
-                "low"
-            ],
-            "rsi": rsi,
-            "ema20": ema20,
-            "ema50": ema50,
-            "macd": macd,
-            "signal": signal,
-            "histogram": histogram,
-            "support": support,
-            "resistance": resistance,
-            "trend": trend,
-        }
-
-    except Exception as error:
-        logger.exception(
-            "Błąd dodatkowego TF %s: %s",
-            interval,
-            error,
-        )
-
-        return {
-            "interval": interval,
-            "error": str(error),
+            "error": "Za mało danych",
         }
 
 
-# =========================================================
-# PEŁNY OBRAZ RYNKU
-# =========================================================
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
 
-def build_full_market_analysis():
-    base = build_market_analysis(
-        "XAUUSD"
+
+    latest = candles[-1]
+
+    ema20 = ema_series(
+        closes,
+        20,
+    )[-1]
+
+    ema50 = ema_series(
+        closes,
+        50,
+    )[-1]
+
+    rsi = calculate_rsi(
+        closes
     )
 
-    h4 = fetch_extra_timeframe(
+    (
+        macd,
+        signal,
+        histogram,
+    ) = calculate_macd(
+        closes
+    )
+
+
+    recent = candles[-30:]
+
+    support = min(
+        candle["low"]
+        for candle in recent
+    )
+
+    resistance = max(
+        candle["high"]
+        for candle in recent
+    )
+
+
+    if ema20 > ema50:
+        trend = "wzrostowy"
+
+    elif ema20 < ema50:
+        trend = "spadkowy"
+
+    else:
+        trend = "neutralny"
+
+
+    return {
+        "interval": interval,
+        "datetime": latest[
+            "datetime"
+        ],
+        "price": latest[
+            "close"
+        ],
+        "open": latest[
+            "open"
+        ],
+        "high": latest[
+            "high"
+        ],
+        "low": latest[
+            "low"
+        ],
+        "rsi": rsi,
+        "ema20": ema20,
+        "ema50": ema50,
+        "macd": macd,
+        "signal": signal,
+        "histogram": histogram,
+        "support": support,
+        "resistance": resistance,
+        "trend": trend,
+    }
+
+
+def get_extra_timeframe_cached(
+    interval,
+):
+    now = time.time()
+
+    if interval == "4h":
+        ttl = H4_CACHE_SECONDS
+
+    elif interval == "1day":
+        ttl = D1_CACHE_SECONDS
+
+    else:
+        ttl = 600
+
+
+    with market_cache_lock:
+        cached = market_cache.get(
+            interval
+        )
+
+        if cached:
+            data = cached.get(
+                "data"
+            )
+
+            timestamp = cached.get(
+                "timestamp",
+                0,
+            )
+
+            if (
+                data is not None
+                and now - timestamp < ttl
+            ):
+                return data
+
+
+    fresh = fetch_extra_timeframe_raw(
+        interval
+    )
+
+
+    # Jeżeli nowe pobranie dostało 429,
+    # a mamy stare poprawne dane,
+    # użyj starego cache zamiast błędu.
+    if "error" in fresh:
+        with market_cache_lock:
+            old = market_cache.get(
+                interval,
+                {},
+            ).get("data")
+
+        if (
+            old
+            and "error" not in old
+        ):
+            logger.warning(
+                "Używam starego cache %s.",
+                interval,
+            )
+
+            return old
+
+        return fresh
+
+
+    with market_cache_lock:
+        market_cache[
+            interval
+        ] = {
+            "data": fresh,
+            "timestamp": now,
+        }
+
+
+    return fresh
+
+
+# =========================================================
+# CACHE 1m / 5m / 15m / H1
+# =========================================================
+
+def get_base_market_cached(
+    force=False,
+):
+    now = time.time()
+
+
+    with market_cache_lock:
+        cached_data = market_cache[
+            "base"
+        ]["data"]
+
+        cached_timestamp = market_cache[
+            "base"
+        ]["timestamp"]
+
+
+        if (
+            not force
+            and cached_data is not None
+            and (
+                now
+                - cached_timestamp
+                < BASE_CACHE_SECONDS
+            )
+        ):
+            return cached_data
+
+
+    # Dzięki lockowi dwa wątki
+    # nie pobiorą danych jednocześnie.
+    with market_fetch_lock:
+
+        now = time.time()
+
+        with market_cache_lock:
+            cached_data = market_cache[
+                "base"
+            ]["data"]
+
+            cached_timestamp = market_cache[
+                "base"
+            ]["timestamp"]
+
+
+            if (
+                not force
+                and cached_data is not None
+                and (
+                    now
+                    - cached_timestamp
+                    < BASE_CACHE_SECONDS
+                )
+            ):
+                return cached_data
+
+
+        if rate_limit_active():
+            if cached_data:
+                logger.warning(
+                    "Rate limit aktywny. "
+                    "Używam ostatnich danych bazowych."
+                )
+
+                return cached_data
+
+            raise RuntimeError(
+                "Rate limit Twelve Data aktywny."
+            )
+
+
+        try:
+            fresh = build_market_analysis(
+                "XAUUSD"
+            )
+
+
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                activate_rate_limit_backoff()
+
+                if cached_data:
+                    return cached_data
+
+            raise
+
+
+        except Exception as error:
+            text = str(error)
+
+            if (
+                "429" in text
+                or "Too Many Requests"
+                in text
+            ):
+                activate_rate_limit_backoff()
+
+                if cached_data:
+                    return cached_data
+
+            raise
+
+
+        with market_cache_lock:
+            market_cache[
+                "base"
+            ] = {
+                "data": fresh,
+                "timestamp": time.time(),
+            }
+
+
+        return fresh
+
+
+# =========================================================
+# JEDEN SNAPSHOT = JEDNO POBRANIE
+# =========================================================
+
+def build_full_market_analysis(
+    force_base=False,
+):
+    base = get_base_market_cached(
+        force=force_base
+    )
+
+    h4 = get_extra_timeframe_cached(
         "4h"
     )
 
-    d1 = fetch_extra_timeframe(
+    d1 = get_extra_timeframe_cached(
         "1day"
     )
 
     return (
-        base
+        list(base)
         + [
             h4,
             d1,
@@ -637,78 +945,151 @@ def build_full_market_analysis():
 
 
 # =========================================================
-# PROSTY PREFILTER
+# PREFILTER
 # =========================================================
 
-def is_bullish(
-    item,
-):
+def is_bullish(item):
     if (
         not item
         or "error" in item
     ):
         return False
 
-    return (
-        item["price"]
-        > item["ema20"]
-        and item["rsi"] >= 50
-        and item["histogram"] > 0
+
+    histogram = item.get(
+        "histogram"
+    )
+
+    rsi = item.get(
+        "rsi"
+    )
+
+    price = item.get(
+        "price"
+    )
+
+    ema20 = item.get(
+        "ema20"
     )
 
 
-def is_bearish(
-    item,
-):
+    if (
+        histogram is None
+        or rsi is None
+        or price is None
+        or ema20 is None
+    ):
+        return False
+
+
+    return (
+        price > ema20
+        and rsi >= 50
+        and histogram > 0
+    )
+
+
+def is_bearish(item):
     if (
         not item
         or "error" in item
     ):
         return False
 
-    return (
-        item["price"]
-        < item["ema20"]
-        and item["rsi"] <= 50
-        and item["histogram"] < 0
+
+    histogram = item.get(
+        "histogram"
+    )
+
+    rsi = item.get(
+        "rsi"
+    )
+
+    price = item.get(
+        "price"
+    )
+
+    ema20 = item.get(
+        "ema20"
     )
 
 
-def get_by_interval(
-    results,
-):
+    if (
+        histogram is None
+        or rsi is None
+        or price is None
+        or ema20 is None
+    ):
+        return False
+
+
+    return (
+        price < ema20
+        and rsi <= 50
+        and histogram < 0
+    )
+
+
+def get_by_interval(results):
     return {
-        item["interval"]: item
+        item.get(
+            "interval"
+        ): item
         for item in results
         if isinstance(
             item,
             dict,
         )
+        and item.get(
+            "interval"
+        )
     }
 
 
-def prefilter_market(
-    results,
+def find_tf(
+    by_tf,
+    *names,
 ):
+    for name in names:
+        if name in by_tf:
+            return by_tf[name]
+
+    return None
+
+
+def prefilter_market(results):
     by_tf = get_by_interval(
         results
     )
 
-    h1 = by_tf.get(
-        "1h"
+    h1 = find_tf(
+        by_tf,
+        "1h",
+        "60min",
+        "60",
     )
 
-    m15 = by_tf.get(
-        "15min"
+    m15 = find_tf(
+        by_tf,
+        "15min",
+        "15m",
+        "15",
     )
 
-    m5 = by_tf.get(
-        "5min"
+    m5 = find_tf(
+        by_tf,
+        "5min",
+        "5m",
+        "5",
     )
 
-    m1 = by_tf.get(
-        "1min"
+    m1 = find_tf(
+        by_tf,
+        "1min",
+        "1m",
+        "1",
     )
+
 
     if not all(
         [
@@ -721,30 +1102,38 @@ def prefilter_market(
         return {
             "candidate": False,
             "type": "NONE",
+            "direction": "NONE",
         }
 
 
     lower_bull = sum(
         [
-            is_bullish(m15),
-            is_bullish(m5),
-            is_bullish(m1),
+            bool(is_bullish(m15)),
+            bool(is_bullish(m5)),
+            bool(is_bullish(m1)),
         ]
     )
 
     lower_bear = sum(
         [
-            is_bearish(m15),
-            is_bearish(m5),
-            is_bearish(m1),
+            bool(is_bearish(m15)),
+            bool(is_bearish(m5)),
+            bool(is_bearish(m1)),
         ]
     )
 
 
-    # Normalny setup zgodny z H1.
+    h1_trend = h1.get(
+        "trend"
+    )
+
+
+    # =====================================================
+    # NORMALNY SETUP
+    # =====================================================
+
     if (
-        h1["trend"]
-        == "wzrostowy"
+        h1_trend == "wzrostowy"
         and lower_bull >= 2
     ):
         return {
@@ -755,8 +1144,7 @@ def prefilter_market(
 
 
     if (
-        h1["trend"]
-        == "spadkowy"
+        h1_trend == "spadkowy"
         and lower_bear >= 2
     ):
         return {
@@ -766,12 +1154,12 @@ def prefilter_market(
         }
 
 
-    # REVERSAL WATCH:
-    # H1 nadal pokazuje stary trend,
-    # ale niższe TF zaczynają grać przeciwnie.
+    # =====================================================
+    # REVERSAL WATCH
+    # =====================================================
+
     if (
-        h1["trend"]
-        == "spadkowy"
+        h1_trend == "spadkowy"
         and lower_bull >= 2
     ):
         return {
@@ -782,8 +1170,7 @@ def prefilter_market(
 
 
     if (
-        h1["trend"]
-        == "wzrostowy"
+        h1_trend == "wzrostowy"
         and lower_bear >= 2
     ):
         return {
@@ -804,10 +1191,9 @@ def prefilter_market(
 # PARSOWANIE ODPOWIEDZI AI
 # =========================================================
 
-def parse_ai_meta(
-    answer,
-):
+def parse_ai_meta(answer):
     upper = answer.upper()
+
 
     status = "NONE"
     direction = "NONE"
@@ -821,10 +1207,9 @@ def parse_ai_meta(
         upper,
     )
 
+
     if status_match:
-        status = (
-            status_match.group(1)
-        )
+        status = status_match.group(1)
 
 
     direction_match = re.search(
@@ -832,6 +1217,7 @@ def parse_ai_meta(
         r"(LONG|SHORT|NONE)",
         upper,
     )
+
 
     if direction_match:
         direction = (
@@ -845,11 +1231,13 @@ def parse_ai_meta(
         upper,
     )
 
+
     if score_match:
         try:
             score = int(
                 score_match.group(1)
             )
+
         except ValueError:
             score = 0
 
@@ -872,6 +1260,7 @@ def parse_ai_meta(
         flags=re.IGNORECASE,
     )
 
+
     display = re.sub(
         r"^\s*DIRECTION\s*=\s*"
         r"[A-Z]+\s*",
@@ -880,6 +1269,7 @@ def parse_ai_meta(
         count=1,
         flags=re.IGNORECASE,
     )
+
 
     display = re.sub(
         r"^\s*SCORE\s*=\s*"
@@ -900,23 +1290,24 @@ def parse_ai_meta(
 
 
 # =========================================================
-# 5 PYTAŃ BOTA + AI
+# AI
+#
+# UWAGA:
+# results dostajemy już pobrane.
+# NIE pobieramy rynku drugi raz.
 # =========================================================
 
 def analyze_market_ai(
+    results,
     signal=None,
     autonomous=False,
     monitoring=False,
     prefilter=None,
 ):
     try:
-        full_results = (
-            build_full_market_analysis()
-        )
-
         base_results = [
             item
-            for item in full_results
+            for item in results
             if item.get(
                 "interval"
             )
@@ -925,16 +1316,22 @@ def analyze_market_ai(
                 "5min",
                 "15min",
                 "1h",
+                "1m",
+                "5m",
+                "15m",
+                "60min",
             )
         ]
+
 
         quality = validate_market_data(
             base_results
         )
 
+
     except Exception as error:
         logger.exception(
-            "Błąd danych rynku: %s",
+            "Błąd kontroli danych rynku: %s",
             error,
         )
 
@@ -970,7 +1367,10 @@ def analyze_market_ai(
     ]
 
 
-    # Cena TradingView kontra Twelve Data.
+    # =====================================================
+    # KONTROLA CENY
+    # =====================================================
+
     if (
         signal
         and not monitoring
@@ -990,6 +1390,7 @@ def analyze_market_ai(
             / strategy_price
             * 100
         )
+
 
         if (
             diff_percent
@@ -1015,7 +1416,7 @@ def analyze_market_ai(
 
 
     market_data = format_market_data(
-        full_results
+        results
     )
 
 
@@ -1042,6 +1443,7 @@ def analyze_market_ai(
             if prefilter
             else "NONE"
         )
+
 
     else:
         source_text = (
@@ -1072,7 +1474,6 @@ KIERUNEK BAZOWY:
 AKTUALNA CENA:
 {current_price}
 
-
 DANE RYNKOWE:
 
 {market_data}
@@ -1099,20 +1500,33 @@ do kierunku, którego oczekujemy?
 unieważnić?
 
 
-WAŻNE:
+BARDZO WAŻNE:
 
-Jeżeli H1 nadal pokazuje stary trend,
-ale 15m i 5m zaczynają tworzyć
-wyraźną zmianę struktury,
-nie ignoruj tego.
+Nie wymagaj idealnej zgodności
+wszystkich interwałów.
 
-Możesz wtedy użyć:
-REVERSAL
+Jeżeli H1 nadal pokazuje
+dotychczasowy trend,
+ale 15m oraz 5m zaczynają
+wyraźnie zmieniać strukturę
+w przeciwną stronę,
+oceń możliwość REVERSAL.
 
-To oznacza:
-rynek nie dał jeszcze pełnego wejścia,
-ale pojawia się realna możliwość
-zmiany kierunku.
+Przykład:
+
+H1 spadkowe,
+ale cena broni wsparcia,
+15m przestaje robić niższe dołki,
+5m wybija lokalny szczyt,
+momentum rośnie.
+
+To NIE musi być jeszcze ENTRY,
+ale może być REVERSAL LONG.
+
+Analogicznie dla SHORT.
+
+Najważniejsze jest zachowanie ceny,
+a wskaźniki są potwierdzeniem.
 """
 
 
@@ -1121,44 +1535,40 @@ Odpowiadaj po polsku.
 
 Jesteś Trading AI Analyzer v2.
 
-Nie próbujesz przewidywać rynku
-za wszelką cenę.
+Twoim zadaniem nie jest
+wymyślanie transakcji na siłę.
 
-Masz ocenić jakość setupu
-i zachowanie ceny.
+Masz oceniać:
+- kontekst,
+- poziom,
+- strukturę,
+- momentum,
+- zachowanie ceny,
+- jakość setupu.
 
 Interwały:
 
-D1 = szeroki kontekst
-H4 = większa struktura
-H1 = główny setup
-15m = struktura krótkoterminowa
-5m = momentum
-1m = timing
+D1 = szeroki kontekst.
+H4 = większa struktura.
+H1 = główny setup.
+15m = struktura krótkoterminowa.
+5m = momentum.
+1m = timing.
 
-D1 i H4 NIE są twardą blokadą.
-Są kontekstem i wpływają na ryzyko.
+D1 i H4 nie są twardą blokadą.
 
-Jeżeli H1 jest jeszcze spadkowe,
-ale 15m/5m wyraźnie zmieniają
-strukturę wzrostowo,
-możesz zwrócić REVERSAL LONG.
-
-Analogicznie w drugą stronę.
+Jeżeli H1 nadal jest w starym
+trendzie, ale 15m/5m wyraźnie
+zmieniają strukturę, możesz
+zwrócić REVERSAL.
 
 Nie wymagaj idealnej zgodności
 wszystkich interwałów.
 
-Nie dawaj wejścia tylko dlatego,
-że jeden wskaźnik zmienił kierunek.
+Nie dawaj ENTRY tylko dlatego,
+że jeden wskaźnik zmienił kolor.
 
-Szukaj:
-- ważnego poziomu,
-- zmiany zachowania ceny,
-- struktury,
-- momentum,
-- potwierdzenia,
-- sensownego risk/reward.
+Szukaj prawdziwego zachowania ceny.
 
 Wybierz dokładnie jeden STATUS:
 
@@ -1166,15 +1576,16 @@ ENTRY
 gdy wejście ma sens TERAZ.
 
 WAIT
-gdy pomysł jest sensowny,
-ale timing jest za słaby.
+gdy kierunek może być dobry,
+ale timing nie jest wystarczający.
 
 REVERSAL
-gdy możliwe jest odwrócenie,
-ale jeszcze nie ma pełnego wejścia.
+gdy pojawia się realna możliwość
+zmiany kierunku, ale wejście
+nie jest jeszcze w pełni potwierdzone.
 
 SETUP
-gdy istnieje ciekawy setup
+gdy pojawia się ciekawa sytuacja
 do obserwacji.
 
 SKIP
@@ -1185,17 +1596,15 @@ NONE
 gdy nie ma nic wartego uwagi.
 
 
-Pierwsze 3 linie MUSZĄ być:
+Pierwsze trzy linie MUSZĄ mieć format:
 
 STATUS=ENTRY
 DIRECTION=LONG
 SCORE=82
 
-Oczywiście wartości dopasuj
-do swojej decyzji.
+Dopasuj wartości do analizy.
 
-SCORE od 0 do 100 oznacza
-jakość setupu.
+SCORE 0-100 oznacza jakość setupu.
 
 Następnie odpowiedz krótko:
 
@@ -1219,6 +1628,9 @@ H1: ...
 Ważny poziom:
 ...
 
+Co robi cena:
+...
+
 Potwierdzenie:
 ...
 
@@ -1228,8 +1640,8 @@ Warunek wejścia:
 Unieważnienie:
 ...
 
-Jeśli STATUS=ENTRY,
-podaj dodatkowo:
+Jeżeli STATUS=ENTRY,
+podaj:
 
 Wejście AI: ...
 SL: ...
@@ -1249,10 +1661,12 @@ Nie pisz długiego komentarza.
             input=prompt,
         )
 
+
         answer = (
             response.output_text
             or "AI nie zwróciło analizy."
         )
+
 
     except Exception as error:
         logger.exception(
@@ -1276,12 +1690,10 @@ Nie pisz długiego komentarza.
 
 
 # =========================================================
-# FORMAT ALERTÓW AUTO
+# FORMAT ALERTÓW
 # =========================================================
 
-def auto_alert_text(
-    result,
-):
+def auto_alert_text(result):
     status = result[
         "status"
     ]
@@ -1290,11 +1702,13 @@ def auto_alert_text(
         "message"
     ]
 
+
     if status == "REVERSAL":
         return (
             "🔄 REVERSAL WATCH\n\n"
             + message
         )
+
 
     if status == "SETUP":
         return (
@@ -1302,11 +1716,13 @@ def auto_alert_text(
             + message
         )
 
+
     if status == "ENTRY":
         return (
             "🚨 WEJŚCIE POTWIERDZONE\n\n"
             + message
         )
+
 
     if status == "SKIP":
         return (
@@ -1314,16 +1730,15 @@ def auto_alert_text(
             + message
         )
 
+
     return None
 
 
 # =========================================================
-# CZY WYSŁAĆ AUTO ALERT
+# ANTY-SPAM
 # =========================================================
 
-def should_send_auto_alert(
-    result,
-):
+def should_send_auto_alert(result):
     status = result[
         "status"
     ]
@@ -1346,8 +1761,6 @@ def should_send_auto_alert(
         return False
 
 
-    # Nie pokazujemy słabych
-    # setupów obserwacyjnych.
     if (
         status in (
             "SETUP",
@@ -1382,6 +1795,7 @@ def should_send_auto_alert(
             ]
         )
 
+
         if (
             same
             and elapsed
@@ -1412,13 +1826,30 @@ def should_send_auto_alert(
 
 # =========================================================
 # AUTOMATYCZNY SKAN
+#
+# NAJWAŻNIEJSZA POPRAWKA:
+# snapshot pobieramy JEDEN RAZ.
 # =========================================================
 
 def auto_scan_once():
     try:
+        if rate_limit_active():
+            logger.info(
+                "AUTO SCAN: "
+                "rate-limit backoff aktywny."
+            )
+
+            return
+
+
+        # ================================================
+        # JEDNO POBRANIE DANYCH
+        # ================================================
+
         results = (
             build_full_market_analysis()
         )
+
 
         candidate = prefilter_market(
             results
@@ -1429,8 +1860,10 @@ def auto_scan_once():
             "candidate"
         ]:
             logger.info(
-                "AUTO SCAN: brak kandydata."
+                "AUTO SCAN: "
+                "brak kandydata."
             )
+
             return
 
 
@@ -1445,7 +1878,13 @@ def auto_scan_once():
         )
 
 
+        # ================================================
+        # AI DOSTAJE TE SAME DANE.
+        # NICZEGO NIE POBIERA PONOWNIE.
+        # ================================================
+
         result = analyze_market_ai(
+            results=results,
             autonomous=True,
             prefilter=candidate,
         )
@@ -1473,6 +1912,15 @@ def auto_scan_once():
 
 
     except Exception as error:
+        text = str(error)
+
+        if (
+            "429" in text
+            or "Too Many Requests"
+            in text
+        ):
+            activate_rate_limit_backoff()
+
         logger.exception(
             "Błąd auto scan: %s",
             error,
@@ -1484,10 +1932,11 @@ def auto_scanner_loop():
         "AUTO SCANNER uruchomiony."
     )
 
-    # Pierwszy skan chwilę po starcie.
-    time.sleep(
-        20
-    )
+    # Po starcie Rendera czekamy,
+    # żeby bot.py / webhook nie odpalały
+    # wszystkiego dokładnie jednocześnie.
+    time.sleep(30)
+
 
     while True:
         auto_scan_once()
@@ -1498,20 +1947,23 @@ def auto_scanner_loop():
 
 
 # =========================================================
-# BLOKADA JEDNEGO SCANNERA
+# TYLKO JEDEN SCANNER NA RENDER
 # =========================================================
 
 def acquire_scanner_lock():
     global scanner_lock_file
 
+
     if fcntl is None:
         return True
+
 
     try:
         scanner_lock_file = open(
             "/tmp/trading_ai_scanner.lock",
             "w",
         )
+
 
         fcntl.flock(
             scanner_lock_file,
@@ -1521,7 +1973,9 @@ def acquire_scanner_lock():
             ),
         )
 
+
         return True
+
 
     except Exception:
         return False
@@ -1530,14 +1984,17 @@ def acquire_scanner_lock():
 def start_auto_scanner():
     global scanner_started
 
+
     if not AUTO_SCAN_ENABLED:
         logger.info(
             "AUTO SCANNER wyłączony."
         )
+
         return
 
 
     with scanner_start_lock:
+
         if scanner_started:
             return
 
@@ -1547,6 +2004,7 @@ def start_auto_scanner():
                 "AUTO SCANNER działa już "
                 "w innym workerze."
             )
+
             return
 
 
@@ -1562,7 +2020,7 @@ def start_auto_scanner():
 
 
 # =========================================================
-# MONITOR STRATEGII
+# MONITOR SYGNAŁU STRATEGII
 # =========================================================
 
 def monitor_strategy_setup(
@@ -1578,6 +2036,7 @@ def monitor_strategy_setup(
         1,
         MONITOR_MAX_CHECKS + 1,
     ):
+
         time.sleep(
             MONITOR_INTERVAL_SECONDS
         )
@@ -1587,6 +2046,7 @@ def monitor_strategy_setup(
             current = active_monitors.get(
                 symbol
             )
+
 
             if (
                 not current
@@ -1605,10 +2065,27 @@ def monitor_strategy_setup(
         )
 
 
-        result = analyze_market_ai(
-            signal=signal,
-            monitoring=True,
-        )
+        try:
+            # Nowe dane tylko gdy cache wygasł.
+            results = (
+                build_full_market_analysis()
+            )
+
+
+            result = analyze_market_ai(
+                results=results,
+                signal=signal,
+                monitoring=True,
+            )
+
+
+        except Exception as error:
+            logger.exception(
+                "Błąd monitoringu: %s",
+                error,
+            )
+
+            continue
 
 
         status = result[
@@ -1623,11 +2100,13 @@ def monitor_strategy_setup(
                 + result["message"]
             )
 
+
             with monitor_lock:
                 active_monitors.pop(
                     symbol,
                     None,
                 )
+
 
             return
 
@@ -1639,11 +2118,13 @@ def monitor_strategy_setup(
                 + result["message"]
             )
 
+
             with monitor_lock:
                 active_monitors.pop(
                     symbol,
                     None,
                 )
+
 
             return
 
@@ -1672,13 +2153,14 @@ def monitor_strategy_setup(
 
 
 # =========================================================
-# ALERT STRATEGII
+# SYGNAŁ TRADINGVIEW
 # =========================================================
 
 def process_alert(text):
     signal = parse_alert(
         text
     )
+
 
     logger.info(
         "TradingView: %s",
@@ -1732,14 +2214,41 @@ def process_alert(text):
         f"{signal['strategy_entry']}\n\n"
         "🤖 Bot v2 analizuje:\n"
         "D1 / H4 / H1 / 15m / 5m / 1m\n"
-        "+ 5 pytań bota."
+        "+ 5 pytań bota\n"
+        "+ REVERSAL WATCH."
     )
 
 
-    result = analyze_market_ai(
-        signal=signal,
-        monitoring=False,
-    )
+    try:
+        # ================================================
+        # ZNOWU: JEDEN SNAPSHOT
+        # ================================================
+
+        results = (
+            build_full_market_analysis()
+        )
+
+
+        result = analyze_market_ai(
+            results=results,
+            signal=signal,
+            monitoring=False,
+        )
+
+
+    except Exception as error:
+        logger.exception(
+            "Błąd analizy alertu: %s",
+            error,
+        )
+
+        send_telegram_message(
+            "⚠️ Nie udało się pobrać "
+            "pełnych danych rynku.\n"
+            "Nie potwierdzam wejścia."
+        )
+
+        return
 
 
     status = result[
@@ -1752,6 +2261,7 @@ def process_alert(text):
             "🚨 WEJŚCIE POTWIERDZONE\n\n"
             + result["message"]
         )
+
         return
 
 
@@ -1760,6 +2270,7 @@ def process_alert(text):
             "❌ SETUP ODRZUCONY\n\n"
             + result["message"]
         )
+
         return
 
 
@@ -1803,6 +2314,7 @@ def process_alert(text):
         daemon=True,
     )
 
+
     thread.start()
 
 
@@ -1812,9 +2324,7 @@ def process_alert(text):
 
 @app.route(
     "/",
-    methods=[
-        "GET",
-    ],
+    methods=["GET"],
 )
 def home():
     return jsonify(
@@ -1829,15 +2339,16 @@ def home():
             "auto_scan_interval": (
                 AUTO_SCAN_INTERVAL_SECONDS
             ),
+            "rate_limit_active": (
+                rate_limit_active()
+            ),
         }
     )
 
 
 @app.route(
     "/health",
-    methods=[
-        "GET",
-    ],
+    methods=["GET"],
 )
 def health():
     with monitor_lock:
@@ -1845,12 +2356,17 @@ def health():
             active_monitors.keys()
         )
 
+
     return jsonify(
         {
             "status": "healthy",
             "active_monitors": monitors,
-            "auto_scanner": (
-                scanner_started
+            "auto_scanner": scanner_started,
+            "rate_limit_active": (
+                rate_limit_active()
+            ),
+            "rate_limit_until": (
+                rate_limit_until
             ),
         }
     )
@@ -1858,14 +2374,13 @@ def health():
 
 @app.route(
     "/webhook",
-    methods=[
-        "POST",
-    ],
+    methods=["POST"],
 )
 def webhook():
     secret = request.args.get(
         "secret"
     )
+
 
     if secret != WEBHOOK_SECRET:
         return jsonify(
@@ -1877,9 +2392,11 @@ def webhook():
 
     try:
         if request.is_json:
+
             data = request.get_json(
                 silent=True
             )
+
 
             if isinstance(
                 data,
@@ -1897,10 +2414,10 @@ def webhook():
                     )
                 )
 
+
             else:
-                text = str(
-                    data
-                )
+                text = str(data)
+
 
         else:
             text = request.get_data(
@@ -1913,6 +2430,7 @@ def webhook():
             "Błąd webhooka: %s",
             error,
         )
+
 
         return jsonify(
             {
@@ -1931,11 +2449,10 @@ def webhook():
 
     thread = threading.Thread(
         target=process_alert,
-        args=(
-            text,
-        ),
+        args=(text,),
         daemon=True,
     )
+
 
     thread.start()
 
@@ -1948,7 +2465,7 @@ def webhook():
 
 
 # =========================================================
-# START SCANNERA
+# START
 # =========================================================
 
 start_auto_scanner()
@@ -1959,12 +2476,14 @@ start_auto_scanner()
 # =========================================================
 
 if __name__ == "__main__":
+
     port = int(
         os.getenv(
             "PORT",
             "10000",
         )
     )
+
 
     app.run(
         host="0.0.0.0",
