@@ -1060,5 +1060,3 @@ def find_tf(
 
     return None
 
-
-def prefilter
