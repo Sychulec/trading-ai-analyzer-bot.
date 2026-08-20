@@ -74,6 +74,7 @@ client = OpenAI(
 # USTAWIENIA
 # =========================================================
 
+# Co ile sekund monitorować setup po sygnale TradingView.
 MONITOR_INTERVAL_SECONDS = int(
     os.getenv(
         "MONITOR_INTERVAL_SECONDS",
@@ -81,6 +82,7 @@ MONITOR_INTERVAL_SECONDS = int(
     )
 )
 
+# Maksymalna liczba kontroli setupu.
 MONITOR_MAX_CHECKS = int(
     os.getenv(
         "MONITOR_MAX_CHECKS",
@@ -88,6 +90,7 @@ MONITOR_MAX_CHECKS = int(
     )
 )
 
+# Automatyczny skaner.
 AUTO_SCAN_ENABLED = (
     os.getenv(
         "AUTO_SCAN_ENABLED",
@@ -96,6 +99,7 @@ AUTO_SCAN_ENABLED = (
     == "true"
 )
 
+# Domyślnie skan co 10 minut.
 AUTO_SCAN_INTERVAL_SECONDS = int(
     os.getenv(
         "AUTO_SCAN_INTERVAL_SECONDS",
@@ -103,6 +107,7 @@ AUTO_SCAN_INTERVAL_SECONDS = int(
     )
 )
 
+# Anti-spam automatycznego skanera.
 AUTO_ALERT_COOLDOWN_SECONDS = int(
     os.getenv(
         "AUTO_ALERT_COOLDOWN_SECONDS",
@@ -110,6 +115,7 @@ AUTO_ALERT_COOLDOWN_SECONDS = int(
     )
 )
 
+# Maksymalna różnica ceny TV vs Twelve Data.
 MAX_PRICE_DIFF_PERCENT = float(
     os.getenv(
         "MAX_PRICE_DIFF_PERCENT",
@@ -117,6 +123,7 @@ MAX_PRICE_DIFF_PERCENT = float(
     )
 )
 
+# Minimalny procent kierunku do ENTRY.
 MIN_ENTRY_PERCENT = int(
     os.getenv(
         "MIN_ENTRY_PERCENT",
@@ -124,6 +131,7 @@ MIN_ENTRY_PERCENT = int(
     )
 )
 
+# Minimalny score dla SETUP / REVERSAL.
 MIN_SETUP_SCORE = int(
     os.getenv(
         "MIN_SETUP_SCORE",
@@ -131,6 +139,33 @@ MIN_SETUP_SCORE = int(
     )
 )
 
+# Minimalne R:R dla ENTRY.
+MIN_ENTRY_RR = float(
+    os.getenv(
+        "MIN_ENTRY_RR",
+        "1.30",
+    )
+)
+
+# Jak blisko poziomu uznajemy,
+# że cena znajduje się przy wsparciu/oporze.
+LEVEL_PROXIMITY_PERCENT = float(
+    os.getenv(
+        "LEVEL_PROXIMITY_PERCENT",
+        "0.20",
+    )
+)
+
+# Blokada identycznych alertów TradingView.
+# 900 sekund = 15 minut.
+TV_ALERT_DEDUP_SECONDS = int(
+    os.getenv(
+        "TV_ALERT_DEDUP_SECONDS",
+        "900",
+    )
+)
+
+# Cache M1/M5/M15/H1.
 BASE_CACHE_SECONDS = int(
     os.getenv(
         "BASE_CACHE_SECONDS",
@@ -138,6 +173,7 @@ BASE_CACHE_SECONDS = int(
     )
 )
 
+# Cache H4.
 H4_CACHE_SECONDS = int(
     os.getenv(
         "H4_CACHE_SECONDS",
@@ -145,6 +181,7 @@ H4_CACHE_SECONDS = int(
     )
 )
 
+# Cache D1.
 D1_CACHE_SECONDS = int(
     os.getenv(
         "D1_CACHE_SECONDS",
@@ -152,6 +189,7 @@ D1_CACHE_SECONDS = int(
     )
 )
 
+# Pauza po 429.
 RATE_LIMIT_BACKOFF_SECONDS = int(
     os.getenv(
         "RATE_LIMIT_BACKOFF_SECONDS",
@@ -170,6 +208,8 @@ auto_lock = threading.Lock()
 market_cache_lock = threading.Lock()
 market_fetch_lock = threading.Lock()
 
+strategy_alert_lock = threading.Lock()
+
 active_monitors = {}
 
 auto_state = {
@@ -179,20 +219,24 @@ auto_state = {
     "last_direction": "NONE",
 }
 
+# Zapamiętane alerty TradingView.
+strategy_alert_seen = {}
+
 scanner_started = False
 scanner_start_lock = threading.Lock()
 scanner_lock_file = None
-
 
 market_cache = {
     "base": {
         "data": None,
         "timestamp": 0,
     },
+
     "4h": {
         "data": None,
         "timestamp": 0,
     },
+
     "1day": {
         "data": None,
         "timestamp": 0,
@@ -243,13 +287,16 @@ def send_telegram_message(text):
 
 
 # =========================================================
-# RATE LIMIT TWELVE DATA
+# RATE LIMIT
 # =========================================================
 
 def rate_limit_active():
     global rate_limit_until
 
-    return time.time() < rate_limit_until
+    return (
+        time.time()
+        < rate_limit_until
+    )
 
 
 def activate_rate_limit_backoff():
@@ -261,13 +308,14 @@ def activate_rate_limit_backoff():
     )
 
     logger.warning(
-        "TWELVE DATA 429. Pauza na %s sekund.",
+        "TWELVE DATA 429. "
+        "Pauza na %s sekund.",
         RATE_LIMIT_BACKOFF_SECONDS,
     )
 
 
 # =========================================================
-# ALERT TRADINGVIEW
+# PARSOWANIE ALERTU TRADINGVIEW
 # =========================================================
 
 def extract_number(pattern, text):
@@ -282,7 +330,10 @@ def extract_number(pattern, text):
 
     try:
         return float(
-            match.group(1).replace(",", ".")
+            match.group(1).replace(
+                ",",
+                ".",
+            )
         )
 
     except ValueError:
@@ -363,6 +414,87 @@ def parse_alert(text):
 
 
 # =========================================================
+# BLOKADA DUPLIKATÓW TRADINGVIEW
+# =========================================================
+
+def build_strategy_alert_key(signal):
+    price = signal.get(
+        "strategy_entry"
+    )
+
+    if price is None:
+        price_text = "NONE"
+    else:
+        price_text = f"{price:.2f}"
+
+    return (
+        f"{signal.get('symbol')}|"
+        f"{signal.get('timeframe')}|"
+        f"{signal.get('side')}|"
+        f"{price_text}"
+    )
+
+
+def cleanup_old_strategy_alerts(now):
+    expired = []
+
+    for key, timestamp in (
+        strategy_alert_seen.items()
+    ):
+        if (
+            now - timestamp
+            > TV_ALERT_DEDUP_SECONDS * 2
+        ):
+            expired.append(key)
+
+    for key in expired:
+        strategy_alert_seen.pop(
+            key,
+            None,
+        )
+
+
+def is_duplicate_strategy_alert(signal):
+    now = time.time()
+
+    key = build_strategy_alert_key(
+        signal
+    )
+
+    with strategy_alert_lock:
+        cleanup_old_strategy_alerts(
+            now
+        )
+
+        previous = (
+            strategy_alert_seen.get(
+                key
+            )
+        )
+
+        if (
+            previous is not None
+            and (
+                now - previous
+                < TV_ALERT_DEDUP_SECONDS
+            )
+        ):
+            logger.info(
+                "Duplikat TradingView "
+                "zablokowany: %s",
+                key,
+            )
+
+            return True
+
+        strategy_alert_seen[
+            key
+        ] = now
+
+    return False
+
+
+# =========================================================
 # WSKAŹNIKI
 # =========================================================
 
@@ -370,7 +502,9 @@ def ema_series(values, period):
     if not values:
         return []
 
-    multiplier = 2 / (period + 1)
+    multiplier = (
+        2 / (period + 1)
+    )
 
     result = [
         values[0]
@@ -445,7 +579,10 @@ def calculate_rsi(
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
     return (
         100
@@ -476,8 +613,7 @@ def calculate_macd(closes):
 
     macd_line = [
         a - b
-        for a, b
-        in zip(
+        for a, b in zip(
             ema12,
             ema26,
         )
@@ -510,8 +646,8 @@ def fetch_extra_timeframe_raw(
         return {
             "interval": interval,
             "error": (
-                "Twelve Data rate-limit "
-                "backoff aktywny"
+                "Twelve Data "
+                "rate-limit backoff aktywny"
             ),
         }
 
@@ -610,15 +746,19 @@ def fetch_extra_timeframe_raw(
                     "datetime": item[
                         "datetime"
                     ],
+
                     "open": float(
                         item["open"]
                     ),
+
                     "high": float(
                         item["high"]
                     ),
+
                     "low": float(
                         item["low"]
                     ),
+
                     "close": float(
                         item["close"]
                     ),
@@ -632,7 +772,9 @@ def fetch_extra_timeframe_raw(
     if len(candles) < 55:
         return {
             "interval": interval,
-            "error": "Za mało danych",
+            "error": (
+                "Za mało danych"
+            ),
         }
 
 
@@ -692,29 +834,38 @@ def fetch_extra_timeframe_raw(
 
     return {
         "interval": interval,
+
         "datetime": latest[
             "datetime"
         ],
+
         "price": latest[
             "close"
         ],
+
         "open": latest[
             "open"
         ],
+
         "high": latest[
             "high"
         ],
+
         "low": latest[
             "low"
         ],
+
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
+
         "macd": macd,
         "signal": signal,
         "histogram": histogram,
+
         "support": support,
         "resistance": resistance,
+
         "trend": trend,
     }
 
@@ -725,18 +876,24 @@ def get_extra_timeframe_cached(
     now = time.time()
 
     if interval == "4h":
-        ttl = H4_CACHE_SECONDS
+        ttl = (
+            H4_CACHE_SECONDS
+        )
 
     elif interval == "1day":
-        ttl = D1_CACHE_SECONDS
+        ttl = (
+            D1_CACHE_SECONDS
+        )
 
     else:
         ttl = 600
 
 
     with market_cache_lock:
-        cached = market_cache.get(
-            interval
+        cached = (
+            market_cache.get(
+                interval
+            )
         )
 
         if cached:
@@ -751,22 +908,29 @@ def get_extra_timeframe_cached(
 
             if (
                 data is not None
-                and now - timestamp < ttl
+                and (
+                    now - timestamp
+                    < ttl
+                )
             ):
                 return data
 
 
-    fresh = fetch_extra_timeframe_raw(
-        interval
+    fresh = (
+        fetch_extra_timeframe_raw(
+            interval
+        )
     )
 
 
     if "error" in fresh:
         with market_cache_lock:
-            old = market_cache.get(
-                interval,
-                {},
-            ).get("data")
+            old = (
+                market_cache.get(
+                    interval,
+                    {},
+                ).get("data")
+            )
 
         if (
             old
@@ -795,7 +959,7 @@ def get_extra_timeframe_cached(
 
 
 # =========================================================
-# CACHE 1m / 5m / 15m / H1
+# CACHE M1/M5/M15/H1
 # =========================================================
 
 def get_base_market_cached(
@@ -803,16 +967,18 @@ def get_base_market_cached(
 ):
     now = time.time()
 
-
     with market_cache_lock:
-        cached_data = market_cache[
-            "base"
-        ]["data"]
+        cached_data = (
+            market_cache[
+                "base"
+            ]["data"]
+        )
 
-        cached_timestamp = market_cache[
-            "base"
-        ]["timestamp"]
-
+        cached_timestamp = (
+            market_cache[
+                "base"
+            ]["timestamp"]
+        )
 
         if (
             not force
@@ -827,18 +993,20 @@ def get_base_market_cached(
 
 
     with market_fetch_lock:
-
         now = time.time()
 
         with market_cache_lock:
-            cached_data = market_cache[
-                "base"
-            ]["data"]
+            cached_data = (
+                market_cache[
+                    "base"
+                ]["data"]
+            )
 
-            cached_timestamp = market_cache[
-                "base"
-            ]["timestamp"]
-
+            cached_timestamp = (
+                market_cache[
+                    "base"
+                ]["timestamp"]
+            )
 
             if (
                 not force
@@ -856,7 +1024,7 @@ def get_base_market_cached(
             if cached_data:
                 logger.warning(
                     "Rate limit aktywny. "
-                    "Używam ostatnich danych bazowych."
+                    "Używam ostatnich danych."
                 )
 
                 return cached_data
@@ -921,12 +1089,16 @@ def build_full_market_analysis(
         force=force_base
     )
 
-    h4 = get_extra_timeframe_cached(
-        "4h"
+    h4 = (
+        get_extra_timeframe_cached(
+            "4h"
+        )
     )
 
-    d1 = get_extra_timeframe_cached(
-        "1day"
+    d1 = (
+        get_extra_timeframe_cached(
+            "1day"
+        )
     )
 
     return (
@@ -939,8 +1111,35 @@ def build_full_market_analysis(
 
 
 # =========================================================
-# PREFILTER
+# HELPERY INTERWAŁÓW
 # =========================================================
+
+def get_by_interval(results):
+    return {
+        item.get(
+            "interval"
+        ): item
+        for item in results
+        if isinstance(
+            item,
+            dict,
+        )
+        and item.get(
+            "interval"
+        )
+    }
+
+
+def find_tf(
+    by_tf,
+    *names,
+):
+    for name in names:
+        if name in by_tf:
+            return by_tf[name]
+
+    return None
+
 
 def is_bullish(item):
     if (
@@ -1024,32 +1223,188 @@ def is_bearish(item):
     )
 
 
-def get_by_interval(results):
-    return {
-        item.get(
-            "interval"
-        ): item
-        for item in results
-        if isinstance(
-            item,
-            dict,
-        )
-        and item.get(
-            "interval"
-        )
-    }
+# =========================================================
+# WAŻNY POZIOM
+# =========================================================
 
-
-def find_tf(
-    by_tf,
-    *names,
+def percent_distance(
+    price,
+    level,
 ):
-    for name in names:
-        if name in by_tf:
-            return by_tf[name]
+    if (
+        price is None
+        or level is None
+        or level == 0
+    ):
+        return None
 
-    return None
+    return (
+        abs(price - level)
+        / abs(level)
+        * 100
+    )
 
+
+def price_near_level(
+    price,
+    level,
+):
+    distance = percent_distance(
+        price,
+        level,
+    )
+
+    if distance is None:
+        return False
+
+    return (
+        distance
+        <= LEVEL_PROXIMITY_PERCENT
+    )
+
+
+def collect_levels(
+    h1,
+    m15,
+):
+    levels = []
+
+    for tf_name, item in (
+        ("H1", h1),
+        ("M15", m15),
+    ):
+        if not item:
+            continue
+
+        support = item.get(
+            "support"
+        )
+
+        resistance = item.get(
+            "resistance"
+        )
+
+        if support is not None:
+            levels.append(
+                {
+                    "tf": tf_name,
+                    "type": "SUPPORT",
+                    "price": support,
+                }
+            )
+
+        if resistance is not None:
+            levels.append(
+                {
+                    "tf": tf_name,
+                    "type": "RESISTANCE",
+                    "price": resistance,
+                }
+            )
+
+    return levels
+
+
+def find_nearest_level(
+    price,
+    levels,
+):
+    valid = []
+
+    for level in levels:
+        level_price = (
+            level.get("price")
+        )
+
+        distance = percent_distance(
+            price,
+            level_price,
+        )
+
+        if distance is None:
+            continue
+
+        valid.append(
+            (
+                distance,
+                level,
+            )
+        )
+
+    if not valid:
+        return None
+
+    valid.sort(
+        key=lambda x: x[0]
+    )
+
+    return valid[0][1]
+
+
+# =========================================================
+# SWEEP / FAŁSZYWE WYBICIE
+# =========================================================
+
+def detect_sweep(
+    item,
+    support=None,
+    resistance=None,
+):
+    if (
+        not item
+        or "error" in item
+    ):
+        return "NONE"
+
+    high = item.get("high")
+    low = item.get("low")
+    close = item.get("price")
+
+    if close is None:
+        close = item.get("close")
+
+
+    if (
+        high is None
+        or low is None
+        or close is None
+    ):
+        return "NONE"
+
+
+    # Sweep dołem:
+    # cena schodzi pod wsparcie,
+    # ale zamyka się ponownie nad nim.
+    if (
+        support is not None
+        and low < support
+        and close > support
+    ):
+        return "BULLISH_SWEEP"
+
+
+    # Sweep górą:
+    # cena wybija opór,
+    # ale zamyka się z powrotem pod nim.
+    if (
+        resistance is not None
+        and high > resistance
+        and close < resistance
+    ):
+        return "BEARISH_SWEEP"
+
+
+    return "NONE"
+
+
+# =========================================================
+# PREFILTER V4
+#
+# H1 = KIERUNEK
+# POZIOM = MIEJSCE
+# M15 = STRUKTURA
+# M5 = TIMING
+# =========================================================
 
 def prefilter_market(results):
     by_tf = get_by_interval(
@@ -1089,12 +1444,20 @@ def prefilter_market(results):
             "candidate": False,
             "type": "NONE",
             "direction": "NONE",
+            "wait_reason": "NONE",
         }
 
+
+    price = (
+        m5.get("price")
+        or m15.get("price")
+        or h1.get("price")
+    )
 
     h1_trend = h1.get(
         "trend"
     )
+
 
     m15_bull = is_bullish(
         m15
@@ -1113,51 +1476,236 @@ def prefilter_market(results):
     )
 
 
-    # H1 + M15
-    if (
-        h1_trend == "wzrostowy"
-        and m15_bull
-    ):
-        return {
-            "candidate": True,
-            "type": "SETUP",
-            "direction": "LONG",
-        }
+    levels = collect_levels(
+        h1,
+        m15,
+    )
+
+    nearest = (
+        find_nearest_level(
+            price,
+            levels,
+        )
+    )
 
 
-    if (
-        h1_trend == "spadkowy"
-        and m15_bear
-    ):
-        return {
-            "candidate": True,
-            "type": "SETUP",
-            "direction": "SHORT",
-        }
+    near_level = False
+    level_type = "NONE"
+    level_price = None
 
 
-    # REVERSAL
-    if (
-        h1_trend == "spadkowy"
-        and m15_bull
-        and m5_bull
-    ):
+    if nearest:
+        level_price = (
+            nearest.get("price")
+        )
+
+        level_type = (
+            nearest.get("type")
+        )
+
+        near_level = (
+            price_near_level(
+                price,
+                level_price,
+            )
+        )
+
+
+    support = m15.get(
+        "support"
+    )
+
+    resistance = m15.get(
+        "resistance"
+    )
+
+
+    sweep = detect_sweep(
+        m15,
+        support=support,
+        resistance=resistance,
+    )
+
+
+    # =====================================================
+    # H1 WZROSTOWE
+    # =====================================================
+
+    if h1_trend == "wzrostowy":
+
+        # Idealny setup LONG.
+        if (
+            m15_bull
+            and m5_bull
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "LONG",
+                "wait_reason": "READY",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # M15 potwierdza LONG,
+        # ale M5 jeszcze nie.
+        if (
+            m15_bull
+            and not m5_bull
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "LONG",
+                "wait_reason": "WAIT_FOR_M5",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # Możliwy reversal SHORT.
+        if (
+            m15_bear
+            and m5_bear
+        ):
+            return {
+                "candidate": True,
+                "type": "REVERSAL",
+                "direction": "SHORT",
+                "wait_reason": "WAIT_FOR_RETEST",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # H1 wzrostowe,
+        # ale cena siedzi przy oporze.
+        if (
+            near_level
+            and level_type == "RESISTANCE"
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "LONG",
+                "wait_reason": "WAIT_FOR_BREAK",
+                "near_level": True,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+    # =====================================================
+    # H1 SPADKOWE
+    # =====================================================
+
+    if h1_trend == "spadkowy":
+
+        # Idealny setup SHORT.
+        if (
+            m15_bear
+            and m5_bear
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "SHORT",
+                "wait_reason": "READY",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # M15 potwierdza SHORT,
+        # ale M5 jeszcze nie.
+        if (
+            m15_bear
+            and not m5_bear
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "SHORT",
+                "wait_reason": "WAIT_FOR_M5",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # Możliwy reversal LONG.
+        if (
+            m15_bull
+            and m5_bull
+        ):
+            return {
+                "candidate": True,
+                "type": "REVERSAL",
+                "direction": "LONG",
+                "wait_reason": "WAIT_FOR_RETEST",
+                "near_level": near_level,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+        # H1 spadkowe,
+        # ale cena siedzi na wsparciu.
+        if (
+            near_level
+            and level_type == "SUPPORT"
+        ):
+            return {
+                "candidate": True,
+                "type": "SETUP",
+                "direction": "SHORT",
+                "wait_reason": "WAIT_FOR_BREAK",
+                "near_level": True,
+                "level_type": level_type,
+                "level_price": level_price,
+                "sweep": sweep,
+            }
+
+
+    # =====================================================
+    # SWEEP MOŻE DAĆ WCZESNY REVERSAL
+    # =====================================================
+
+    if sweep == "BULLISH_SWEEP":
         return {
             "candidate": True,
             "type": "REVERSAL",
             "direction": "LONG",
+            "wait_reason": "WAIT_FOR_M5",
+            "near_level": near_level,
+            "level_type": level_type,
+            "level_price": level_price,
+            "sweep": sweep,
         }
 
 
-    if (
-        h1_trend == "wzrostowy"
-        and m15_bear
-        and m5_bear
-    ):
+    if sweep == "BEARISH_SWEEP":
         return {
             "candidate": True,
             "type": "REVERSAL",
             "direction": "SHORT",
+            "wait_reason": "WAIT_FOR_M5",
+            "near_level": near_level,
+            "level_type": level_type,
+            "level_price": level_price,
+            "sweep": sweep,
         }
 
 
@@ -1165,11 +1713,12 @@ def prefilter_market(results):
         "candidate": False,
         "type": "NONE",
         "direction": "NONE",
+        "wait_reason": "NONE",
     }
 
 
 # =========================================================
-# PARSOWANIE AI
+# PARSOWANIE AI V4
 # =========================================================
 
 def parse_ai_meta(answer):
@@ -1182,6 +1731,8 @@ def parse_ai_meta(answer):
     long_pct = 0
     short_pct = 0
     wait_pct = 100
+
+    wait_reason = "NONE"
 
 
     def get_int(
@@ -1235,13 +1786,15 @@ def parse_ai_meta(answer):
 
     status_match = re.search(
         r"STATUS\s*=\s*"
-        r"(ENTRY|WAIT|SKIP|"
-        r"REVERSAL|SETUP|NONE)",
+        r"(ENTRY|WAIT|SETUP|REVERSAL|"
+        r"SKIP|INVALIDATED|NONE)",
         upper,
     )
 
     if status_match:
-        status = status_match.group(1)
+        status = (
+            status_match.group(1)
+        )
 
 
     direction_match = re.search(
@@ -1253,6 +1806,22 @@ def parse_ai_meta(answer):
     if direction_match:
         direction = (
             direction_match.group(1)
+        )
+
+
+    wait_reason_match = re.search(
+        r"WAIT_REASON\s*=\s*"
+        r"(READY|WAIT_FOR_BREAK|"
+        r"WAIT_FOR_RETEST|"
+        r"WAIT_FOR_M5|"
+        r"WAIT_FOR_RR|"
+        r"INVALIDATED|NONE)",
+        upper,
+    )
+
+    if wait_reason_match:
+        wait_reason = (
+            wait_reason_match.group(1)
         )
 
 
@@ -1279,7 +1848,6 @@ def parse_ai_meta(answer):
         + short_pct
         + wait_pct
     )
-
 
     if total <= 0:
         long_pct = 0
@@ -1373,9 +1941,10 @@ def parse_ai_meta(answer):
         else ""
     )
 
-
-    if len(reason) > 180:
-        reason = reason[:180]
+    if len(reason) > 200:
+        reason = (
+            reason[:200]
+        )
 
 
     return {
@@ -1387,8 +1956,11 @@ def parse_ai_meta(answer):
         "short_pct": short_pct,
         "wait_pct": wait_pct,
 
+        "wait_reason": wait_reason,
+
         "price": price,
         "entry": entry,
+
         "activation": activation,
         "activation_side": activation_side,
 
@@ -1397,6 +1969,7 @@ def parse_ai_meta(answer):
         "tp2": tp2,
 
         "invalidation": invalidation,
+
         "rr": rr,
         "reason": reason,
 
@@ -1405,7 +1978,61 @@ def parse_ai_meta(answer):
 
 
 # =========================================================
-# AI
+# R:R
+# =========================================================
+
+def calculate_rr(
+    direction,
+    entry,
+    sl,
+    tp,
+):
+    if (
+        entry is None
+        or sl is None
+        or tp is None
+    ):
+        return None
+
+
+    if direction == "LONG":
+        risk = (
+            entry - sl
+        )
+
+        reward = (
+            tp - entry
+        )
+
+
+    elif direction == "SHORT":
+        risk = (
+            sl - entry
+        )
+
+        reward = (
+            entry - tp
+        )
+
+
+    else:
+        return None
+
+
+    if risk <= 0:
+        return None
+
+    if reward <= 0:
+        return None
+
+
+    return (
+        reward / risk
+    )
+
+
+# =========================================================
+# AI V4
 # =========================================================
 
 def analyze_market_ai(
@@ -1434,9 +2061,10 @@ def analyze_market_ai(
             )
         ]
 
-
-        quality = validate_market_data(
-            base_results
+        quality = (
+            validate_market_data(
+                base_results
+            )
         )
 
 
@@ -1450,9 +2078,13 @@ def analyze_market_ai(
             "status": "ERROR",
             "direction": "NONE",
             "score": 0,
+
             "long_pct": 0,
             "short_pct": 0,
             "wait_pct": 100,
+
+            "wait_reason": "NONE",
+
             "message": (
                 "⚠️ Błąd danych rynkowych."
             ),
@@ -1462,26 +2094,38 @@ def analyze_market_ai(
     if not quality["ok"]:
         return {
             "status": "WAIT",
+
             "direction": (
                 signal["side"]
                 if signal
                 else "NONE"
             ),
+
             "score": 0,
+
             "long_pct": 0,
             "short_pct": 0,
             "wait_pct": 100,
+
+            "wait_reason": "NONE",
+
             "message": (
-                "⚠️ Dane rynkowe "
+                "⚠️ Dane rynku "
                 "nie przeszły kontroli."
             ),
         }
 
 
-    current_price = quality[
-        "current_price"
-    ]
+    current_price = (
+        quality[
+            "current_price"
+        ]
+    )
 
+
+    # =====================================================
+    # KONTROLA CENY
+    # =====================================================
 
     if (
         signal
@@ -1490,9 +2134,11 @@ def analyze_market_ai(
             "strategy_entry"
         )
     ):
-        strategy_price = signal[
-            "strategy_entry"
-        ]
+        strategy_price = (
+            signal[
+                "strategy_entry"
+            ]
+        )
 
         diff_percent = (
             abs(
@@ -1503,7 +2149,6 @@ def analyze_market_ai(
             * 100
         )
 
-
         if (
             diff_percent
             > MAX_PRICE_DIFF_PERCENT
@@ -1513,25 +2158,40 @@ def analyze_market_ai(
                 "direction": signal[
                     "side"
                 ],
+
                 "score": 0,
+
                 "long_pct": 0,
                 "short_pct": 0,
                 "wait_pct": 100,
+
+                "wait_reason": (
+                    "WAIT_FOR_RETEST"
+                ),
+
                 "price": current_price,
+
+                "reason": (
+                    "Cena oddaliła się "
+                    "od ceny strategii."
+                ),
+
                 "message": (
                     "⚠️ Różnica cen."
                 ),
             }
 
 
-    market_data = format_market_data(
-        results
+    market_data = (
+        format_market_data(
+            results
+        )
     )
 
 
     if autonomous:
         source_text = (
-            "AUTOMATYCZNY SKAN rynku. "
+            "AUTOMATYCZNY SKAN RYNKU. "
             "Nie ma sygnału TradingView."
         )
 
@@ -1553,11 +2213,46 @@ def analyze_market_ai(
             else "NONE"
         )
 
+        wait_hint = (
+            prefilter.get(
+                "wait_reason",
+                "NONE",
+            )
+            if prefilter
+            else "NONE"
+        )
+
+        sweep_text = (
+            prefilter.get(
+                "sweep",
+                "NONE",
+            )
+            if prefilter
+            else "NONE"
+        )
+
+        level_price = (
+            prefilter.get(
+                "level_price"
+            )
+            if prefilter
+            else None
+        )
+
+        level_type = (
+            prefilter.get(
+                "level_type",
+                "NONE",
+            )
+            if prefilter
+            else "NONE"
+        )
+
 
     else:
         source_text = (
-            "Analiza sygnału "
-            "ze strategii TradingView."
+            "TO JEST SYGNAŁ "
+            "ZE STRATEGII TRADINGVIEW."
         )
 
         direction_text = (
@@ -1569,6 +2264,11 @@ def analyze_market_ai(
         candidate_text = (
             "STRATEGY_SIGNAL"
         )
+
+        wait_hint = "NONE"
+        sweep_text = "NONE"
+        level_price = None
+        level_type = "NONE"
 
 
     prompt = f"""
@@ -1583,138 +2283,269 @@ KIERUNEK BAZOWY:
 AKTUALNA CENA:
 {current_price}
 
+PREFILTER WAIT:
+{wait_hint}
+
+SWEEP:
+{sweep_text}
+
+NAJBLIŻSZY WAŻNY POZIOM:
+{level_type} {level_price}
+
 DANE RYNKOWE:
 
 {market_data}
 
 
-ZASTOSUJ 5 PYTAŃ BOTA:
+========================================
+NAJWAŻNIEJSZA ZASADA
+========================================
 
-1. Czy H1 wspiera kierunek?
+H1 = KIERUNEK / KONTEKST.
 
-2. Czy cena znajduje się
-przy ważnym poziomie?
+M15 = GŁÓWNA STRUKTURA SETUPU.
 
-3. Czy M15 daje prawdziwe
-potwierdzenie struktury?
-
-4. Czy M5 potwierdza timing
-i momentum wejścia?
-
-5. Jeśli cena nie zachowuje się
-zgodnie z oczekiwaniem,
-czy setup należy anulować?
-
-
-HIERARCHIA:
-
-D1 = szeroki kontekst.
-H4 = większy kontekst.
-
-H1 = GŁÓWNY KIERUNEK.
-M15 = GŁÓWNY SETUP.
 M5 = TIMING.
 
-M1 NIE MOŻE DECYDOWAĆ
-O KIERUNKU.
+M1 NIE DECYDUJE O TRANSAKCJI.
 
-Nie wymagaj idealnej zgodności
-D1/H4 z H1.
 
-Nie wymuszaj wejścia.
+========================================
+5 PYTAŃ BOTA
+========================================
 
-Najważniejsza jest
-struktura ceny.
+1. Czy większy kontekst
+wspiera kierunek lub przynajmniej
+go nie unieważnia?
+
+2. Czy jesteśmy przy ważnym
+poziomie rynku?
+
+3. Czy nastąpiło prawdziwe
+potwierdzenie struktury M15?
+
+4. Czy M5 potwierdza timing?
+
+5. Jeśli cena nie zachowuje się
+tak jak powinna,
+czy setup należy unieważnić?
+
+
+========================================
+KOLEJNOŚĆ DECYZJI
+========================================
+
+H1
+↓
+WAŻNY POZIOM
+↓
+SWEEP / BREAK
+↓
+M15
+↓
+RETEST
+↓
+M5
+↓
+ENTRY
+
+
+Nie wchodź tylko dlatego,
+że wskaźniki są zielone/czerwone.
+
+Najpierw zachowanie ceny.
+
+
+========================================
+SYGNAŁ TRADINGVIEW
+========================================
+
+Jeżeli jest to sygnał strategii:
+
+NIE oceniaj kierunku od zera.
+
+Strategia podała hipotezę bazową.
+
+Twoim zadaniem jest znaleźć:
+
+1. czy istnieje mocny powód
+do ODRZUCENIA sygnału,
+
+lub
+
+2. na jakie konkretne
+potwierdzenie trzeba czekać.
+
+Nie odrzucaj dobrego LONG
+tylko dlatego,
+że H1 jeszcze formalnie
+ma stary trend.
+
+Jeżeli M15 zmienia strukturę,
+poziom został obroniony,
+a M5 poprawia momentum,
+możesz zaakceptować zmianę kierunku.
+
+
+========================================
+WAIT
+========================================
+
+Jeżeli nie ma ENTRY,
+powiedz dokładnie,
+NA CO czekamy:
+
+WAIT_FOR_BREAK
+
+WAIT_FOR_RETEST
+
+WAIT_FOR_M5
+
+WAIT_FOR_RR
+
+INVALIDATED
+
+
+WAIT_FOR_BREAK =
+cena stoi przed ważnym poziomem.
+
+WAIT_FOR_RETEST =
+poziom został wybity,
+ale nie było jeszcze
+potwierdzonego retestu.
+
+WAIT_FOR_M5 =
+H1/M15 są dobre,
+ale timing M5 jeszcze nie.
+
+WAIT_FOR_RR =
+setup jest dobry,
+ale wejście ma za słabe R:R.
+
+INVALIDATED =
+pierwotny setup już nie ma sensu.
 """
 
 
-    instructions = """
+    instructions = f"""
 Odpowiadaj po polsku.
 
-Jesteś Trading AI Analyzer.
+Jesteś Trading AI Analyzer V4.
 
-GŁÓWNE INTERWAŁY:
+Masz być selektywny,
+ale nie możesz blokować dobrych
+sygnałów tylko dlatego,
+że jeden interwał jest spóźniony.
 
 H1 = kierunek.
 M15 = setup.
 M5 = timing.
 
-D1 i H4 = szerszy kontekst.
+M1 = szum dodatkowy.
 
-M1 nie może decydować
-o kierunku transakcji.
-
-Najważniejsze są:
-
-- struktura ceny,
-- ważny poziom,
-- H1,
-- M15,
-- reakcja ceny,
-- momentum M5.
-
-Jeżeli H1 i M15 nie dają
-wystarczającego potwierdzenia,
-wybierz WAIT.
-
-Oceń osobno:
-
-LONG
-SHORT
-CZEKAJ
-
-Procenty oznaczają siłę argumentów.
-Nie oznaczają gwarancji zysku.
-
-LONG_PCT + SHORT_PCT + WAIT_PCT
-muszą dawać dokładnie 100.
-
-ENTRY tylko wtedy,
-gdy kierunek LONG lub SHORT
-ma co najmniej około 70%
-i H1 + M15 potwierdzają setup.
-
-Jeżeli cena jest przy wsparciu
-lub oporze i nie ma wybicia,
-wybierz WAIT.
+D1 i H4 = kontekst.
 
 
-STATUS:
+========================================
+SIŁA KIERUNKU
+========================================
+
+Podaj:
+
+LONG_PCT
+SHORT_PCT
+WAIT_PCT
+
+Suma = dokładnie 100.
+
+To NIE jest gwarancja zysku.
+
+To siła argumentów.
+
+
+========================================
+ENTRY
+========================================
+
+ENTRY dopiero gdy:
+
+- setup ma sens strukturalnie,
+- M15 potwierdza,
+- timing nie jest zły,
+- poziom jest logiczny,
+- R:R jest akceptowalne.
+
+Minimalna preferowana siła
+kierunku:
+
+{MIN_ENTRY_PERCENT}%
+
+Minimalne preferowane R:R:
+
+1:{MIN_ENTRY_RR:.2f}
+
+
+========================================
+STATUS
+========================================
+
+Dozwolone:
 
 ENTRY
 WAIT
 SETUP
 REVERSAL
 SKIP
+INVALIDATED
 NONE
 
 
-DIRECTION:
+========================================
+WAIT_REASON
+========================================
 
-LONG
-SHORT
+Dozwolone:
+
+READY
+WAIT_FOR_BREAK
+WAIT_FOR_RETEST
+WAIT_FOR_M5
+WAIT_FOR_RR
+INVALIDATED
 NONE
 
 
-ODPOWIEDŹ MUSI ZACZYNAĆ SIĘ TAK:
+========================================
+FORMAT
+========================================
+
+Pierwsze linie MUSZĄ wyglądać tak:
 
 STATUS=WAIT
-DIRECTION=SHORT
-SCORE=62
-LONG_PCT=25
-SHORT_PCT=60
-WAIT_PCT=15
-PRICE=4355.11
+DIRECTION=LONG
+SCORE=68
+LONG_PCT=58
+SHORT_PCT=12
+WAIT_PCT=30
+WAIT_REASON=WAIT_FOR_BREAK
+PRICE=4441.30
 ENTRY=0
-ACTIVATION=4352.70
-ACTIVATION_SIDE=BELOW
-SL=4363.00
-TP1=4340.00
-TP2=4325.00
-INVALIDATION=4363.00
-RR=1:2.3
-REASON=H1 spadkowe, ale M15 nie potwierdziło jeszcze wybicia.
+ACTIVATION=4449.00
+ACTIVATION_SIDE=ABOVE
+SL=4431.00
+TP1=4465.00
+TP2=4480.00
+INVALIDATION=4431.00
+RR=1:1.8
+REASON=Cena stoi pod oporem; czekamy na wybicie i utrzymanie poziomu.
 
+
+Jeżeli nie ma ENTRY teraz:
+
+ENTRY=0.
+
+ACTIVATION =
+konkretny poziom aktywacji.
 
 ACTIVATION_SIDE:
 
@@ -1722,32 +2553,30 @@ ABOVE
 BELOW
 NONE
 
-ENTRY=0,
-jeśli nie ma wejścia teraz.
+SL:
+musi wynikać ze struktury.
 
-SL ma wynikać ze struktury.
-
-TP1 i TP2 mają wynikać
+TP1/TP2:
 z ważnych poziomów.
 
-Nie podawaj TP3.
+Nie dawaj TP3.
 
-REASON maksymalnie jedno zdanie.
+REASON:
+maksymalnie jedno krótkie zdanie.
 
-Nie wypisuj później osobno
-D1, H4, H1, M15, M5, M1.
-
-Nie pisz długiego komentarza.
+Nie wypisuj później
+całej analizy interwałów.
 """
 
 
     try:
-        response = client.responses.create(
-            model="gpt-5-mini",
-            instructions=instructions,
-            input=prompt,
+        response = (
+            client.responses.create(
+                model="gpt-5-mini",
+                instructions=instructions,
+                input=prompt,
+            )
         )
-
 
         answer = (
             response.output_text
@@ -1765,9 +2594,13 @@ Nie pisz długiego komentarza.
             "status": "ERROR",
             "direction": "NONE",
             "score": 0,
+
             "long_pct": 0,
             "short_pct": 0,
             "wait_pct": 100,
+
+            "wait_reason": "NONE",
+
             "message": (
                 "⚠️ Błąd analizy AI."
             ),
@@ -1787,40 +2620,92 @@ Nie pisz długiego komentarza.
         )
 
 
-    if result["status"] == "ENTRY":
+    # =====================================================
+    # WALIDACJA ENTRY
+    # =====================================================
 
-        if result["direction"] == "LONG":
-            direction_strength = result[
-                "long_pct"
-            ]
+    if (
+        result[
+            "status"
+        ] == "ENTRY"
+    ):
 
-        elif result["direction"] == "SHORT":
-            direction_strength = result[
-                "short_pct"
-            ]
+        if (
+            result["direction"]
+            == "LONG"
+        ):
+            direction_strength = (
+                result["long_pct"]
+            )
+
+        elif (
+            result["direction"]
+            == "SHORT"
+        ):
+            direction_strength = (
+                result["short_pct"]
+            )
 
         else:
             direction_strength = 0
 
 
+        # Za słaby procent.
         if (
             direction_strength
             < MIN_ENTRY_PERCENT
         ):
             logger.warning(
-                "ENTRY ma tylko %s%%. "
+                "ENTRY %s ma tylko %s%%. "
                 "Zmiana na WAIT.",
+                result["direction"],
                 direction_strength,
             )
 
             result["status"] = "WAIT"
+            result["wait_reason"] = (
+                "WAIT_FOR_M5"
+            )
+
+
+        # Kontrola R:R.
+        entry = (
+            result.get("entry")
+            or current_price
+        )
+
+        sl = result.get("sl")
+        tp1 = result.get("tp1")
+
+        calculated_rr = calculate_rr(
+            result["direction"],
+            entry,
+            sl,
+            tp1,
+        )
+
+        if (
+            calculated_rr is not None
+            and calculated_rr
+            < MIN_ENTRY_RR
+        ):
+            logger.warning(
+                "ENTRY ma za słabe R:R %.2f. "
+                "Zmiana na WAIT_FOR_RR.",
+                calculated_rr,
+            )
+
+            result["status"] = "WAIT"
+            result["wait_reason"] = (
+                "WAIT_FOR_RR"
+            )
 
 
     return result
 
 
 # =========================================================
-# FORMAT TELEGRAM
+# FORMAT TELEGRAM V4
 # =========================================================
 
 def format_compact_signal(result):
@@ -1853,6 +2738,11 @@ def format_compact_signal(result):
         0,
     )
 
+    wait_reason = result.get(
+        "wait_reason",
+        "NONE",
+    )
+
     entry = result.get(
         "entry"
     )
@@ -1866,25 +2756,15 @@ def format_compact_signal(result):
         "NONE",
     )
 
-    sl = result.get(
-        "sl"
-    )
-
-    tp1 = result.get(
-        "tp1"
-    )
-
-    tp2 = result.get(
-        "tp2"
-    )
+    sl = result.get("sl")
+    tp1 = result.get("tp1")
+    tp2 = result.get("tp2")
 
     invalidation = result.get(
         "invalidation"
     )
 
-    rr = result.get(
-        "rr"
-    )
+    rr = result.get("rr")
 
     reason = result.get(
         "reason",
@@ -1892,7 +2772,25 @@ def format_compact_signal(result):
     )
 
 
-    lines = []
+    wait_labels = {
+        "READY": "GOTOWY",
+        "WAIT_FOR_BREAK": (
+            "CZEKAJ NA WYBICIE"
+        ),
+        "WAIT_FOR_RETEST": (
+            "CZEKAJ NA RETEST"
+        ),
+        "WAIT_FOR_M5": (
+            "CZEKAJ NA M5"
+        ),
+        "WAIT_FOR_RR": (
+            "CZEKAJ — SŁABE R:R"
+        ),
+        "INVALIDATED": (
+            "SETUP ZANEGOWANY"
+        ),
+        "NONE": "CZEKAJ",
+    }
 
 
     if status == "ENTRY":
@@ -1900,6 +2798,9 @@ def format_compact_signal(result):
 
     elif status == "REVERSAL":
         icon = "🔄"
+
+    elif status == "INVALIDATED":
+        icon = "❌"
 
     elif status in (
         "WAIT",
@@ -1914,19 +2815,18 @@ def format_compact_signal(result):
         icon = "📊"
 
 
-    lines.append(
+    lines = [
         f"{icon} XAUUSD | H1 + M15"
-    )
+    ]
 
 
-    if price:
+    if price is not None:
         lines.append(
             f"Cena: {price:.2f}"
         )
 
 
     lines.append("")
-
 
     lines.append(
         f"🟢 LONG: {long_pct}%"
@@ -1939,7 +2839,6 @@ def format_compact_signal(result):
     lines.append(
         f"⚪ CZEKAJ: {wait_pct}%"
     )
-
 
     lines.append("")
 
@@ -1954,14 +2853,22 @@ def format_compact_signal(result):
             f"🔄 REVERSAL: {direction}"
         )
 
-    elif status == "SKIP":
+    elif status in (
+        "INVALIDATED",
+        "SKIP",
+    ):
         lines.append(
             "❌ DECYZJA: POMIŃ"
         )
 
     else:
+        label = wait_labels.get(
+            wait_reason,
+            "CZEKAJ",
+        )
+
         lines.append(
-            "⏳ DECYZJA: CZEKAJ"
+            f"⏳ {label}"
         )
 
 
@@ -1980,11 +2887,16 @@ def format_compact_signal(result):
         and activation > 0
         and direction != "NONE"
     ):
-
-        if activation_side == "ABOVE":
+        if (
+            activation_side
+            == "ABOVE"
+        ):
             sign = ">"
 
-        elif activation_side == "BELOW":
+        elif (
+            activation_side
+            == "BELOW"
+        ):
             sign = "<"
 
         else:
@@ -2032,7 +2944,7 @@ def format_compact_signal(result):
         and direction != "NONE"
     ):
         lines.append(
-            f"❌ Zanegowanie: "
+            "❌ Zanegowanie: "
             f"{invalidation:.2f}"
         )
 
@@ -2045,6 +2957,7 @@ def format_compact_signal(result):
 
     if reason:
         lines.append("")
+
         lines.append(
             f"💬 {reason}"
         )
@@ -2056,7 +2969,7 @@ def format_compact_signal(result):
 
 
 # =========================================================
-# ALERTY
+# AUTO ALERT
 # =========================================================
 
 def auto_alert_text(result):
@@ -2066,6 +2979,7 @@ def auto_alert_text(result):
         "SETUP",
         "REVERSAL",
         "SKIP",
+        "INVALIDATED",
     ):
         return None
 
@@ -2075,7 +2989,7 @@ def auto_alert_text(result):
 
 
 # =========================================================
-# ANTY-SPAM
+# ANTY-SPAM AUTO SCAN
 # =========================================================
 
 def should_send_auto_alert(result):
@@ -2101,12 +3015,20 @@ def should_send_auto_alert(result):
         0,
     )
 
+    wait_reason = result.get(
+        "wait_reason",
+        "NONE",
+    )
 
+
+    # WAIT z automatycznego skanera
+    # nie wysyłamy bez końca.
     if status not in (
         "SETUP",
         "REVERSAL",
         "ENTRY",
         "SKIP",
+        "INVALIDATED",
     ):
         return False
 
@@ -2138,7 +3060,8 @@ def should_send_auto_alert(result):
     key = (
         f"{status}|"
         f"{direction}|"
-        f"{strength_bucket}"
+        f"{strength_bucket}|"
+        f"{wait_reason}"
     )
 
     now = time.time()
@@ -2208,8 +3131,10 @@ def auto_scan_once():
         )
 
 
-        candidate = prefilter_market(
-            results
+        candidate = (
+            prefilter_market(
+                results
+            )
         )
 
 
@@ -2225,12 +3150,22 @@ def auto_scan_once():
 
 
         logger.info(
-            "AUTO SCAN: kandydat %s %s",
+            (
+                "AUTO SCAN: "
+                "kandydat %s %s "
+                "wait=%s sweep=%s"
+            ),
             candidate.get(
                 "type"
             ),
             candidate.get(
                 "direction"
+            ),
+            candidate.get(
+                "wait_reason"
+            ),
+            candidate.get(
+                "sweep"
             ),
         )
 
@@ -2246,28 +3181,40 @@ def auto_scan_once():
             (
                 "AUTO SCAN AI: "
                 "%s %s score=%s "
-                "LONG=%s SHORT=%s WAIT=%s"
+                "LONG=%s SHORT=%s "
+                "WAIT=%s reason=%s"
             ),
             result["status"],
             result["direction"],
             result["score"],
+
             result.get(
                 "long_pct"
             ),
+
             result.get(
                 "short_pct"
             ),
+
             result.get(
                 "wait_pct"
+            ),
+
+            result.get(
+                "wait_reason"
             ),
         )
 
 
-        if should_send_auto_alert(
-            result
-        ):
-            text = auto_alert_text(
+        if (
+            should_send_auto_alert(
                 result
+            )
+        ):
+            text = (
+                auto_alert_text(
+                    result
+                )
             )
 
             if text:
@@ -2294,7 +3241,7 @@ def auto_scan_once():
 
 def auto_scanner_loop():
     logger.info(
-        "AUTO SCANNER uruchomiony."
+        "AUTO SCANNER V4 uruchomiony."
     )
 
     time.sleep(30)
@@ -2309,7 +3256,7 @@ def auto_scanner_loop():
 
 
 # =========================================================
-# JEDEN SCANNER
+# JEDEN SCANNER NA RENDER
 # =========================================================
 
 def acquire_scanner_lock():
@@ -2326,7 +3273,6 @@ def acquire_scanner_lock():
             "w",
         )
 
-
         fcntl.flock(
             scanner_lock_file,
             (
@@ -2334,7 +3280,6 @@ def acquire_scanner_lock():
                 | fcntl.LOCK_NB
             ),
         )
-
 
         return True
 
@@ -2382,7 +3327,7 @@ def start_auto_scanner():
 
 
 # =========================================================
-# MONITOR SYGNAŁU STRATEGII
+# MONITOR SETUPU TRADINGVIEW
 # =========================================================
 
 def monitor_strategy_setup(
@@ -2394,21 +3339,24 @@ def monitor_strategy_setup(
     ]
 
 
+    last_wait_reason = None
+
+
     for check_number in range(
         1,
         MONITOR_MAX_CHECKS + 1,
     ):
-
         time.sleep(
             MONITOR_INTERVAL_SECONDS
         )
 
 
         with monitor_lock:
-            current = active_monitors.get(
-                symbol
+            current = (
+                active_monitors.get(
+                    symbol
+                )
             )
-
 
             if (
                 not current
@@ -2432,7 +3380,6 @@ def monitor_strategy_setup(
                 build_full_market_analysis()
             )
 
-
             result = analyze_market_ai(
                 results=results,
                 signal=signal,
@@ -2453,6 +3400,15 @@ def monitor_strategy_setup(
             "status"
         ]
 
+        wait_reason = result.get(
+            "wait_reason",
+            "NONE",
+        )
+
+
+        # =================================================
+        # ENTRY
+        # =================================================
 
         if status == "ENTRY":
             send_telegram_message(
@@ -2461,34 +3417,41 @@ def monitor_strategy_setup(
                 )
             )
 
-
             with monitor_lock:
                 active_monitors.pop(
                     symbol,
                     None,
                 )
 
-
             return
 
 
-        if status == "SKIP":
+        # =================================================
+        # INVALIDATED / SKIP
+        # =================================================
+
+        if status in (
+            "INVALIDATED",
+            "SKIP",
+        ):
             send_telegram_message(
                 format_compact_signal(
                     result
                 )
             )
 
-
             with monitor_lock:
                 active_monitors.pop(
                     symbol,
                     None,
                 )
 
-
             return
 
+
+        # =================================================
+        # REVERSAL
+        # =================================================
 
         if status == "REVERSAL":
             send_telegram_message(
@@ -2496,6 +3459,34 @@ def monitor_strategy_setup(
                     result
                 )
             )
+
+
+        # =================================================
+        # ZMIANA POWODU WAIT
+        #
+        # np. najpierw WAIT_FOR_BREAK,
+        # potem WAIT_FOR_RETEST.
+        # =================================================
+
+        elif (
+            wait_reason
+            != last_wait_reason
+            and wait_reason
+            not in (
+                "NONE",
+                "READY",
+            )
+        ):
+            send_telegram_message(
+                format_compact_signal(
+                    result
+                )
+            )
+
+
+        last_wait_reason = (
+            wait_reason
+        )
 
 
     with monitor_lock:
@@ -2508,8 +3499,8 @@ def monitor_strategy_setup(
     send_telegram_message(
         "⌛ XAUUSD | H1 + M15\n\n"
         "Obserwacja zakończona.\n"
-        "Brak wystarczającego "
-        "potwierdzenia wejścia."
+        "Setup nie uzyskał "
+        "pełnego potwierdzenia."
     )
 
 
@@ -2529,15 +3520,17 @@ def process_alert(text):
     )
 
 
-    if signal[
-        "event"
-    ] != "ENTRY":
+    if (
+        signal["event"]
+        != "ENTRY"
+    ):
         return
 
 
-    if signal[
-        "symbol"
-    ] != "XAUUSD":
+    if (
+        signal["symbol"]
+        != "XAUUSD"
+    ):
         return
 
 
@@ -2556,12 +3549,21 @@ def process_alert(text):
         return
 
 
+    # =====================================================
+    # V4 — DUPLIKAT
+    # =====================================================
+
+    if is_duplicate_strategy_alert(
+        signal
+    ):
+        return
+
+
     side_icon = (
         "🟢"
         if signal[
             "side"
-        ]
-        == "LONG"
+        ] == "LONG"
         else "🔴"
     )
 
@@ -2573,8 +3575,8 @@ def process_alert(text):
         f"{signal['side']}\n"
         f"Cena sygnału: "
         f"{signal['strategy_entry']}\n\n"
-        "🤖 Analizuję H1 + M15.\n"
-        "M5 = timing."
+        "🤖 V4 analizuje:\n"
+        "H1 → poziom → M15 → M5"
     )
 
 
@@ -2582,7 +3584,6 @@ def process_alert(text):
         results = (
             build_full_market_analysis()
         )
-
 
         result = analyze_market_ai(
             results=results,
@@ -2617,9 +3618,12 @@ def process_alert(text):
     )
 
 
+    # ENTRY albo anulowanie =
+    # nie uruchamiamy dalszego monitoringu.
     if status in (
         "ENTRY",
         "SKIP",
+        "INVALIDATED",
     ):
         return
 
@@ -2629,6 +3633,8 @@ def process_alert(text):
     )
 
 
+    # Jeżeli dla XAUUSD był stary monitor,
+    # nowy monitor go zastępuje.
     with monitor_lock:
         active_monitors[
             signal["symbol"]
@@ -2638,6 +3644,11 @@ def process_alert(text):
                 "side"
             ],
             "started": time.time(),
+            "strategy_entry": (
+                signal.get(
+                    "strategy_entry"
+                )
+            ),
         }
 
 
@@ -2649,7 +3660,6 @@ def process_alert(text):
         ),
         daemon=True,
     )
-
 
     thread.start()
 
@@ -2666,24 +3676,36 @@ def home():
     return jsonify(
         {
             "status": "ok",
+
             "service": (
-                "Trading AI Analyzer v3"
+                "Trading AI Analyzer V4"
             ),
-            "decision_timeframes": (
-                "H1 + M15"
+
+            "decision_flow": (
+                "H1 -> LEVEL -> "
+                "M15 -> RETEST -> M5"
             ),
-            "timing_timeframe": (
-                "M5"
-            ),
+
             "auto_scan_enabled": (
                 AUTO_SCAN_ENABLED
             ),
+
             "auto_scan_interval": (
                 AUTO_SCAN_INTERVAL_SECONDS
             ),
+
             "min_entry_percent": (
                 MIN_ENTRY_PERCENT
             ),
+
+            "min_entry_rr": (
+                MIN_ENTRY_RR
+            ),
+
+            "tv_dedup_seconds": (
+                TV_ALERT_DEDUP_SECONDS
+            ),
+
             "rate_limit_active": (
                 rate_limit_active()
             ),
@@ -2705,11 +3727,21 @@ def health():
     return jsonify(
         {
             "status": "healthy",
-            "active_monitors": monitors,
-            "auto_scanner": scanner_started,
+
+            "version": "V4",
+
+            "active_monitors": (
+                monitors
+            ),
+
+            "auto_scanner": (
+                scanner_started
+            ),
+
             "rate_limit_active": (
                 rate_limit_active()
             ),
+
             "rate_limit_until": (
                 rate_limit_until
             ),
@@ -2730,18 +3762,18 @@ def webhook():
     if secret != WEBHOOK_SECRET:
         return jsonify(
             {
-                "error": "invalid secret",
+                "error": (
+                    "invalid secret"
+                ),
             }
         ), 403
 
 
     try:
         if request.is_json:
-
             data = request.get_json(
                 silent=True
             )
-
 
             if isinstance(
                 data,
@@ -2759,14 +3791,15 @@ def webhook():
                     )
                 )
 
-
             else:
                 text = str(data)
 
 
         else:
-            text = request.get_data(
-                as_text=True
+            text = (
+                request.get_data(
+                    as_text=True
+                )
             )
 
 
@@ -2776,18 +3809,24 @@ def webhook():
             error,
         )
 
-
         return jsonify(
             {
-                "error": "invalid request",
+                "error": (
+                    "invalid request"
+                ),
             }
         ), 400
 
 
-    if not text or not text.strip():
+    if (
+        not text
+        or not text.strip()
+    ):
         return jsonify(
             {
-                "error": "empty alert",
+                "error": (
+                    "empty alert"
+                ),
             }
         ), 400
 
@@ -2797,7 +3836,6 @@ def webhook():
         args=(text,),
         daemon=True,
     )
-
 
     thread.start()
 
@@ -2810,7 +3848,7 @@ def webhook():
 
 
 # =========================================================
-# START AUTO SCANNER
+# START
 # =========================================================
 
 start_auto_scanner()
@@ -2828,7 +3866,6 @@ if __name__ == "__main__":
             "10000",
         )
     )
-
 
     app.run(
         host="0.0.0.0",
