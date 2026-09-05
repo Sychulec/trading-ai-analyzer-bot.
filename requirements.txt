@@ -2,3 +2,7 @@ openai
 python-telegram-bot
 flask
 gunicorn
+requests
+ctrader-open-api
+Twisted
+protobuf
