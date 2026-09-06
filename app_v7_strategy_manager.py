@@ -35,6 +35,8 @@ state = {
     "account_found": False,
     "account_authorized": False,
     "account_id": None,
+    "trader_login": None,
+    "broker": None,
     "is_live": None,
     "balance_raw": None,
     "last_error": None,
@@ -131,26 +133,46 @@ def start_ctrader():
 
         elif pt == ProtoOAGetAccountListByAccessTokenRes().payloadType:
             res = Protobuf.extract(message)
-            ids = [
-                (int(a.ctidTraderAccountId), bool(getattr(a, "isLive", False)))
-                for a in res.ctidTraderAccount
-            ]
-            log(f"[TEST] ACCOUNT LIST = {ids}")
+            accounts = []
+            for a in res.ctidTraderAccount:
+                info = {
+                    "ctidTraderAccountId": int(a.ctidTraderAccountId),
+                    "traderLogin": int(getattr(a, "traderLogin", 0) or 0),
+                    "brokerTitleShort": str(getattr(a, "brokerTitleShort", "") or ""),
+                    "isLive": bool(getattr(a, "isLive", False)),
+                }
+                accounts.append(info)
 
+            log(f"[TEST] ACCOUNT LIST FULL = {accounts}")
+
+            # IMPORTANT:
+            # 17188951 is the login visible in the cTrader UI.
+            # Open API uses a different internal ctidTraderAccountId for requests.
             match = [
                 a for a in res.ctidTraderAccount
-                if int(a.ctidTraderAccountId) == TARGET_ACCOUNT_ID
+                if int(getattr(a, "traderLogin", 0) or 0) == TARGET_ACCOUNT_ID
             ]
 
             if not match:
-                set_error(f"TARGET {TARGET_ACCOUNT_ID} NOT FOUND; returned={ids}")
+                set_error(
+                    f"TRADER LOGIN {TARGET_ACCOUNT_ID} NOT FOUND; returned={accounts}"
+                )
                 return
 
             account = match[0]
+
             state["account_found"] = True
             state["account_id"] = int(account.ctidTraderAccountId)
             state["is_live"] = bool(getattr(account, "isLive", False))
-            log(f"[TEST] TARGET FOUND id={state['account_id']} isLive={state['is_live']}")
+            state["trader_login"] = int(getattr(account, "traderLogin", 0) or 0)
+            state["broker"] = str(getattr(account, "brokerTitleShort", "") or "")
+
+            log(
+                f"[TEST] TARGET LOGIN FOUND traderLogin={state['trader_login']} "
+                f"ctidTraderAccountId={state['account_id']} "
+                f"broker={state['broker']} isLive={state['is_live']}"
+            )
+
             send_account_auth()
 
         elif pt == ProtoOAAccountAuthRes().payloadType:
@@ -270,6 +292,8 @@ def ctrader_callback():
     state["account_found"] = False
     state["account_authorized"] = False
     state["account_id"] = None
+    state["trader_login"] = None
+    state["broker"] = None
     state["is_live"] = None
     state["balance_raw"] = None
     state["last_error"] = None
