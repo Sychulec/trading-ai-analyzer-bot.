@@ -82,7 +82,7 @@ MIN_SIGNAL_SCORE = 68
 AUTO_REFRESH_SECONDS = 300
 
 # V7: strategia TradingView wybiera wejście, bot tylko wykonuje i prowadzi pozycję.
-print("[CTRADER] ENDPOINT = DEMO | LIVE ACCOUNTS BLOCKED")
+print("[CTRADER] ENDPOINT = LIVE ROUTE | HARD LOCK ACCOUNT = 17188951")
 STRATEGY_ONLY_MODE = True
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -3027,13 +3027,13 @@ def start_ctrader_connection():
         return
 
     # SAFETY: V7 demo testing must never connect to the live cTrader endpoint.
-    # Keep this on PROTOBUF_DEMO_HOST until demo tests are finished.
+    # Account 17188951 is routed by cTrader through the LIVE Open API endpoint.
     ctrader_client = Client(
-        EndPoints.PROTOBUF_DEMO_HOST,
+        EndPoints.PROTOBUF_LIVE_HOST,
         EndPoints.PROTOBUF_PORT,
         TcpProtocol,
     )
-    print("[CTRADER] ENDPOINT = DEMO")
+    print("[CTRADER] CONNECTION ROUTE = LIVE | ONLY ACCOUNT 17188951 ALLOWED")
 
     def connected(client):
         ctrader_state[
@@ -3130,30 +3130,34 @@ def start_ctrader_connection():
 
                 return
 
-            # DEMO-ONLY safety gate:
-            # Never authorize a LIVE account on this build.
-            demo_accounts = [
+            # HARD SAFETY LOCK:
+            # This build may authorize ONLY cTrader account 17188951.
+            # cTrader exposes this FTMO Free/test account on the LIVE API route,
+            # so we do NOT use the isLive flag as the safety condition.
+            allowed_account_id = 17188951
+
+            matching_accounts = [
                 account
                 for account in response.ctidTraderAccount
-                if not bool(getattr(account, "isLive", False))
+                if int(account.ctidTraderAccountId) == allowed_account_id
             ]
 
-            if not demo_accounts:
+            if not matching_accounts:
                 ctrader_state[
                     "account_id"
                 ] = None
 
                 set_error(
-                    "Brak autoryzowanego rachunku DEMO - LIVE jest zablokowane"
+                    f"Dozwolone konto {allowed_account_id} nie zostalo zwrocone przez cTrader"
                 )
 
                 print(
-                    "[CTRADER] NO DEMO ACCOUNT FOUND - LIVE BLOCKED"
+                    f"[CTRADER] ALLOWED ACCOUNT NOT FOUND id={allowed_account_id} - ALL OTHER ACCOUNTS BLOCKED"
                 )
 
                 return
 
-            account = demo_accounts[0]
+            account = matching_accounts[0]
 
             ctrader_state[
                 "account_id"
@@ -3162,7 +3166,7 @@ def start_ctrader_connection():
             )
 
             print(
-                f"[CTRADER] DEMO ACCOUNT FOUND id={ctrader_state['account_id']} isLive={bool(getattr(account, 'isLive', False))}"
+                f"[CTRADER] ALLOWED ACCOUNT FOUND id={ctrader_state['account_id']} isLive={bool(getattr(account, 'isLive', False))}"
             )
 
             authorize_account(
