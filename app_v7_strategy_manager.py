@@ -19,6 +19,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAErrorRes,
 )
 from twisted.internet import reactor
+from twisted.internet.task import LoopingCall
 
 app = Flask(__name__)
 
@@ -41,6 +42,7 @@ state = {
 
 client = None
 reactor_started = False
+pending_oauth_action = False
 
 
 def log(msg):
@@ -175,12 +177,39 @@ def start_ctrader():
     client.startService()
 
 
+def process_pending_actions():
+    global pending_oauth_action
+
+    if not pending_oauth_action:
+        return
+
+    pending_oauth_action = False
+    log("[TEST] OAUTH ACTION DEQUEUED IN REACTOR")
+
+    if state["app_authorized"]:
+        send_account_list()
+    elif state["connected"]:
+        send_app_auth()
+    else:
+        start_ctrader()
+
+
 def start_reactor():
     global reactor_started
     if reactor_started:
         return
+
     reactor_started = True
-    reactor.callWhenRunning(start_ctrader)
+
+    def when_running():
+        start_ctrader()
+
+        poller = LoopingCall(process_pending_actions)
+        poller.start(0.25, now=False)
+
+        log("[TEST] REACTOR QUEUE POLLER STARTED")
+
+    reactor.callWhenRunning(when_running)
     reactor.run(installSignalHandlers=False)
 
 
@@ -247,15 +276,11 @@ def ctrader_callback():
 
     log("[TEST] OAUTH TOKEN RECEIVED")
 
-    def after_oauth():
-        if state["app_authorized"]:
-            send_account_list()
-        elif state["connected"]:
-            send_app_auth()
-        else:
-            start_ctrader()
-
-    reactor.callFromThread(after_oauth)
+    # Flask/Gunicorn tylko ustawia flagę. Twisted sam odczyta ją
+    # w swoim własnym wątku przez LoopingCall.
+    global pending_oauth_action
+    pending_oauth_action = True
+    log("[TEST] OAUTH ACTION QUEUED")
 
     return jsonify({
         "status": "success",
