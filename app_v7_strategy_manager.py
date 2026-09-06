@@ -4731,17 +4731,50 @@ def ctrader_callback():
         "market_loading"
     ] = False
 
-    if not reactor_started:
+    # OAuth callback can arrive while an old DEMO TCP connection is still alive.
+    # Do not rely only on start_ctrader_connection(), because that path may keep
+    # stale authorization state. Force a fresh application/account-list cycle.
+    if not getattr(reactor, "running", False):
         threading.Thread(
             target=start_reactor,
             daemon=True,
         ).start()
 
-        time.sleep(0.5)
+        for _ in range(50):
+            if getattr(reactor, "running", False):
+                break
+            time.sleep(0.1)
 
-    reactor.callFromThread(
-        start_ctrader_connection
-    )
+    def oauth_reauthorize_demo():
+        global ctrader_client
+
+        print("[CTRADER] OAUTH CALLBACK -> FORCE DEMO REAUTH")
+
+        ctrader_state["account_authorized"] = False
+        ctrader_state["account_id"] = None
+        ctrader_state["market_ready"] = False
+        ctrader_state["market_loading"] = False
+
+        if ctrader_client is not None and ctrader_state.get("connected"):
+            # Re-authorize the application on the existing DEMO socket first.
+            # APP AUTH response will trigger REQUEST ACCOUNT LIST.
+            ctrader_state["application_authorized"] = False
+
+            req = ProtoOAApplicationAuthReq()
+            req.clientId = CTRADER_CLIENT_ID
+            req.clientSecret = CTRADER_CLIENT_SECRET
+
+            print("[CTRADER] FORCE APP AUTH AFTER OAUTH")
+            ctrader_client.send(req).addErrback(safe_errback)
+        else:
+            ctrader_state["application_authorized"] = False
+            start_ctrader_connection()
+
+    if getattr(reactor, "running", False):
+        reactor.callFromThread(oauth_reauthorize_demo)
+    else:
+        set_error("Twisted reactor nie wystartował po OAuth")
+        print("[CTRADER] OAUTH REAUTH FAILED - REACTOR NOT RUNNING")
 
     return jsonify({
         "status": "success",
