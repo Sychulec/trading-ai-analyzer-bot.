@@ -2709,7 +2709,9 @@ def request_account_data(client):
         )
 
         print(
-            "[CTRADER] REQUEST SYMBOL LIST"
+            f"[CTRADER] REQUEST SYMBOL LIST "
+            f"ctidTraderAccountId={account_id}",
+            flush=True,
         )
 
         client.send(
@@ -3791,13 +3793,45 @@ def start_ctrader_connection():
                 or "ALREADY_LOGGED_IN"
                 in description
             ):
+                clear_error()
+
+                # If we already selected the exact target account and just sent
+                # ACCOUNT AUTH, ALREADY_LOGGED_IN means that account session is
+                # already authorized. Do NOT restart APP AUTH / ACCOUNT LIST,
+                # otherwise we create an endless auth loop.
+                if (
+                    ctrader_state.get("account_id")
+                    and int(ctrader_state.get("account_id"))
+                    > 0
+                ):
+                    ctrader_state["application_authorized"] = True
+                    ctrader_state["account_authorized"] = True
+                    ctrader_state["market_ready"] = False
+                    ctrader_state["market_loading"] = False
+
+                    print(
+                        f"[CTRADER] ALREADY_LOGGED_IN -> "
+                        f"ACCOUNT SESSION ACCEPTED "
+                        f"traderLogin={TARGET_TRADER_LOGIN} "
+                        f"ctidTraderAccountId={ctrader_state.get('account_id')} "
+                        f"-> REQUEST MARKET DATA",
+                        flush=True,
+                    )
+
+                    reactor.callLater(
+                        0.2,
+                        request_account_data,
+                        client,
+                    )
+
+                    return
+
+                # Fallback only when no target account has been selected yet:
+                # ALREADY_LOGGED_IN applies to application auth.
                 ctrader_state["application_authorized"] = True
                 ctrader_state["account_authorized"] = False
-                ctrader_state["account_id"] = None
                 ctrader_state["market_ready"] = False
                 ctrader_state["market_loading"] = False
-
-                clear_error()
 
                 print(
                     "[CTRADER] ALREADY_LOGGED_IN (APP) -> ACCOUNT LIST",
