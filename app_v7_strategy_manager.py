@@ -2642,85 +2642,66 @@ def authorize_account(client):
 symbol_retry_scheduled = False
 
 def request_account_data(client):
-    if not ctrader_state[
-        "account_authorized"
-    ]:
+    """
+    XAU market bootstrap first.
+    Important: request the symbol list BEFORE trader/reconcile/PnL.
+    This prevents an earlier account-data request from blocking market bootstrap.
+    """
+    if not ctrader_state["account_authorized"]:
+        print("[CTRADER] MARKET BOOT ABORTED: account not authorized", flush=True)
         return
 
-    account_id = int(
-        ctrader_state["account_id"]
+    account_id = int(ctrader_state["account_id"])
+
+    print(
+        f"[CTRADER] MARKET BOOT START account_id={account_id}",
+        flush=True,
     )
 
-    trader_req = ProtoOATraderReq()
-
-    trader_req.ctidTraderAccountId = (
-        account_id
-    )
-
-    client.send(
-        trader_req
-    ).addErrback(
-        safe_errback
-    )
-
-    reconcile_req = (
-        ProtoOAReconcileReq()
-    )
-
-    reconcile_req.ctidTraderAccountId = (
-        account_id
-    )
-
-    client.send(
-        reconcile_req
-    ).addErrback(
-        safe_errback
-    )
-
-    pnl_req = (
-        ProtoOAGetPositionUnrealizedPnLReq()
-    )
-
-    pnl_req.ctidTraderAccountId = (
-        account_id
-    )
-
-    client.send(
-        pnl_req
-    ).addErrback(
-        safe_errback
-    )
-
+    # 1. SYMBOL LIST FIRST — this is required for XAUUSD market readiness.
     symbols_ready = all(
-        market_state[
-            instrument
-        ]["found"]
-        for instrument
-        in ALLOWED_INSTRUMENTS
+        market_state[instrument]["found"]
+        for instrument in ALLOWED_INSTRUMENTS
     )
 
     if not symbols_ready:
-        symbols_req = (
-            ProtoOASymbolsListReq()
-        )
+        symbols_req = ProtoOASymbolsListReq()
+        symbols_req.ctidTraderAccountId = account_id
+        symbols_req.includeArchivedSymbols = False
 
-        symbols_req.ctidTraderAccountId = (
-            account_id
-        )
+        print("[CTRADER] REQUEST SYMBOL LIST", flush=True)
 
-        symbols_req.includeArchivedSymbols = (
-            False
-        )
+        try:
+            d = client.send(symbols_req)
+            d.addErrback(safe_errback)
+            print("[CTRADER] SYMBOL LIST REQUEST SENT", flush=True)
+        except Exception as error:
+            print(
+                "[CTRADER] SYMBOL LIST SEND EXCEPTION:",
+                repr(error),
+                flush=True,
+            )
+            set_error("Symbol list send exception: " + str(error))
+            return
 
-        print(
-            "[CTRADER] REQUEST SYMBOL LIST"
-        )
+    # 2. Remaining account data are secondary and must not prevent symbol loading.
+    account_requests = [
+        ("TRADER", ProtoOATraderReq()),
+        ("RECONCILE", ProtoOAReconcileReq()),
+        ("UNREALIZED_PNL", ProtoOAGetPositionUnrealizedPnLReq()),
+    ]
 
-        client.send(
-            symbols_req
-        ).addErrback(
-            safe_errback
-        )
+    for name, req in account_requests:
+        req.ctidTraderAccountId = account_id
+        try:
+            client.send(req).addErrback(safe_errback)
+            print(f"[CTRADER] {name} REQUEST SENT", flush=True)
+        except Exception as error:
+            # Log it, but DO NOT stop XAU market bootstrap.
+            print(
+                f"[CTRADER] {name} SEND EXCEPTION: {error!r}",
+                flush=True,
+            )
 
 
 # ============================================================
