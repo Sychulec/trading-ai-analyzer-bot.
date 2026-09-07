@@ -84,7 +84,7 @@ AUTO_REFRESH_SECONDS = 300
 
 # V7: strategia TradingView wybiera wejście, bot tylko wykonuje i prowadzi pozycję.
 TARGET_TRADER_LOGIN = 17188951
-print(f"[CTRADER] LIVE ROUTE | TARGET traderLogin={TARGET_TRADER_LOGIN}")
+print(f"[CTRADER] LIVE ROUTE | TARGET traderLogin={TARGET_TRADER_LOGIN} | XAUUSD ONLY")
 STRATEGY_ONLY_MODE = True
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -98,7 +98,6 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 ALLOWED_INSTRUMENTS = (
     "XAUUSD",
-    "US100",
 )
 
 BOT_LABEL = "FTMO_AUTO_V6_3"
@@ -2638,6 +2637,55 @@ def authorize_account(client):
 # ACCOUNT DATA
 # ============================================================
 
+symbol_retry_scheduled = False
+
+def request_symbol_list_with_retry(client):
+    global symbol_retry_scheduled
+
+    if not ctrader_state.get("account_authorized"):
+        return
+    if ctrader_state.get("market_ready"):
+        symbol_retry_scheduled = False
+        return
+
+    account_id = ctrader_state.get("account_id")
+    if account_id is None:
+        return
+
+    # If XAUUSD details are already known, continue to candles instead of
+    # requesting the list again.
+    symbols_ready = all(
+        market_state[instrument]["found"]
+        and market_state[instrument]["digits"] is not None
+        for instrument in ALLOWED_INSTRUMENTS
+    )
+    if symbols_ready:
+        symbol_retry_scheduled = False
+        start_market_queue(client)
+        return
+
+    req = ProtoOASymbolsListReq()
+    req.ctidTraderAccountId = int(account_id)
+    req.includeArchivedSymbols = False
+
+    print(
+        f"[CTRADER] REQUEST SYMBOL LIST ctidTraderAccountId={account_id}",
+        flush=True,
+    )
+    client.send(req).addErrback(safe_errback)
+
+    if not symbol_retry_scheduled:
+        symbol_retry_scheduled = True
+
+        def _retry():
+            global symbol_retry_scheduled
+            symbol_retry_scheduled = False
+            if ctrader_state.get("account_authorized") and not ctrader_state.get("market_ready"):
+                print("[CTRADER] SYMBOL LIST RETRY", flush=True)
+                request_symbol_list_with_retry(client)
+
+        reactor.callLater(15.0, _retry)
+
 def request_account_data(client):
     if not ctrader_state[
         "account_authorized"
@@ -2689,37 +2737,15 @@ def request_account_data(client):
     )
 
     symbols_ready = all(
-        market_state[
-            instrument
-        ]["found"]
-        for instrument
-        in ALLOWED_INSTRUMENTS
+        market_state[instrument]["found"]
+        and market_state[instrument]["digits"] is not None
+        for instrument in ALLOWED_INSTRUMENTS
     )
 
     if not symbols_ready:
-        symbols_req = (
-            ProtoOASymbolsListReq()
-        )
-
-        symbols_req.ctidTraderAccountId = (
-            account_id
-        )
-
-        symbols_req.includeArchivedSymbols = (
-            False
-        )
-
-        print(
-            f"[CTRADER] REQUEST SYMBOL LIST "
-            f"ctidTraderAccountId={account_id}",
-            flush=True,
-        )
-
-        client.send(
-            symbols_req
-        ).addErrback(
-            safe_errback
-        )
+        request_symbol_list_with_retry(client)
+    else:
+        start_market_queue(client)
 
 
 # ============================================================
@@ -3436,9 +3462,9 @@ def start_ctrader_connection():
                     int(symbol.symbolId)
                 )
 
-            if len(found_ids) < 2:
+            if len(found_ids) < len(ALLOWED_INSTRUMENTS):
                 set_error(
-                    "Nie znaleziono obu symboli"
+                    "Nie znaleziono wymaganych symboli"
                 )
 
                 return
@@ -3949,9 +3975,12 @@ def parse_strategy_alert(text):
     )
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    if re.search(r"\bWEJSCIE\s+LONG\b", normalized):
+    # Avoid fragile regex boundaries here: TradingView text may contain
+    # non-breaking spaces / Unicode variants. After normalization, simple
+    # token matching is the most reliable.
+    if "WEJSCIE LONG" in normalized:
         side = "LONG"
-    elif re.search(r"\bWEJSCIE\s+SHORT\b", normalized):
+    elif "WEJSCIE SHORT" in normalized:
         side = "SHORT"
     else:
         side = None
@@ -4097,7 +4126,7 @@ def process_strategy_alert(text):
             ch for ch in debug_norm
             if not unicodedata.combining(ch)
         )
-        debug_norm = re.sub(r"\s+", " ", debug_norm).strip()
+        debug_norm = re.sub(r"\\s+", " ", debug_norm).strip()
         print(
             f"[TV] REJECTED reason=NO_ENTRY_SIDE normalized={debug_norm[:500]}",
             flush=True,
