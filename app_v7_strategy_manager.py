@@ -60,6 +60,8 @@ from twisted.internet import reactor
 
 app = Flask(__name__)
 
+print("[BOOT] V7 USING PROVEN FTMO RISK BOT CTRADER MARKET CORE")
+
 
 # ============================================================
 # CONFIG
@@ -2639,53 +2641,6 @@ def authorize_account(client):
 
 symbol_retry_scheduled = False
 
-def request_symbol_list_with_retry(client):
-    global symbol_retry_scheduled
-
-    if not ctrader_state.get("account_authorized"):
-        return
-    if ctrader_state.get("market_ready"):
-        symbol_retry_scheduled = False
-        return
-
-    account_id = ctrader_state.get("account_id")
-    if account_id is None:
-        return
-
-    # If XAUUSD details are already known, continue to candles instead of
-    # requesting the list again.
-    symbols_ready = all(
-        market_state[instrument]["found"]
-        and market_state[instrument]["digits"] is not None
-        for instrument in ALLOWED_INSTRUMENTS
-    )
-    if symbols_ready:
-        symbol_retry_scheduled = False
-        start_market_queue(client)
-        return
-
-    req = ProtoOASymbolsListReq()
-    req.ctidTraderAccountId = int(account_id)
-    req.includeArchivedSymbols = False
-
-    print(
-        f"[CTRADER] REQUEST SYMBOL LIST ctidTraderAccountId={account_id}",
-        flush=True,
-    )
-    client.send(req).addErrback(safe_errback)
-
-    if not symbol_retry_scheduled:
-        symbol_retry_scheduled = True
-
-        def _retry():
-            global symbol_retry_scheduled
-            symbol_retry_scheduled = False
-            if ctrader_state.get("account_authorized") and not ctrader_state.get("market_ready"):
-                print("[CTRADER] SYMBOL LIST RETRY", flush=True)
-                request_symbol_list_with_retry(client)
-
-        reactor.callLater(15.0, _retry)
-
 def request_account_data(client):
     if not ctrader_state[
         "account_authorized"
@@ -2737,15 +2692,35 @@ def request_account_data(client):
     )
 
     symbols_ready = all(
-        market_state[instrument]["found"]
-        and market_state[instrument]["digits"] is not None
-        for instrument in ALLOWED_INSTRUMENTS
+        market_state[
+            instrument
+        ]["found"]
+        for instrument
+        in ALLOWED_INSTRUMENTS
     )
 
     if not symbols_ready:
-        request_symbol_list_with_retry(client)
-    else:
-        start_market_queue(client)
+        symbols_req = (
+            ProtoOASymbolsListReq()
+        )
+
+        symbols_req.ctidTraderAccountId = (
+            account_id
+        )
+
+        symbols_req.includeArchivedSymbols = (
+            False
+        )
+
+        print(
+            "[CTRADER] REQUEST SYMBOL LIST"
+        )
+
+        client.send(
+            symbols_req
+        ).addErrback(
+            safe_errback
+        )
 
 
 # ============================================================
