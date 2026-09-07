@@ -3947,11 +3947,11 @@ def parse_strategy_alert(text):
         ch for ch in normalized
         if not unicodedata.combining(ch)
     )
-    normalized = re.sub(r"\\s+", " ", normalized).strip()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    if re.search(r"\\bWEJSCIE\\s+LONG\\b", normalized):
+    if re.search(r"\bWEJSCIE\s+LONG\b", normalized):
         side = "LONG"
-    elif re.search(r"\\bWEJSCIE\\s+SHORT\\b", normalized):
+    elif re.search(r"\bWEJSCIE\s+SHORT\b", normalized):
         side = "SHORT"
     else:
         side = None
@@ -4097,7 +4097,7 @@ def process_strategy_alert(text):
             ch for ch in debug_norm
             if not unicodedata.combining(ch)
         )
-        debug_norm = re.sub(r"\\s+", " ", debug_norm).strip()
+        debug_norm = re.sub(r"\s+", " ", debug_norm).strip()
         print(
             f"[TV] REJECTED reason=NO_ENTRY_SIDE normalized={debug_norm[:500]}",
             flush=True,
