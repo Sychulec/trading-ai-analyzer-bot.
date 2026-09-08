@@ -141,6 +141,7 @@ ctrader_state = {
 
     "positions": [],
     "orders": [],
+    "positions_reconciled_at": None,
 
     "market_loading": False,
     "market_ready": False,
@@ -3363,6 +3364,12 @@ def start_ctrader_connection():
             ctrader_state[
                 "positions"
             ] = positions
+            ctrader_state["positions_reconciled_at"] = int(time.time())
+
+            # cTrader RECONCILE is the source of truth for live positions.
+            # Synchronize manager state only after a fresh reconcile response,
+            # never from a stale/temporarily empty in-memory list.
+            sync_manager_with_reconcile()
 
             ctrader_state[
                 "orders"
@@ -4147,6 +4154,7 @@ def register_filled_strategy_position(response, instrument):
         "best_price": actual_entry,
         "opened_at": int(time.time()),
         "last_managed_at": 0,
+        "reconcile_misses": 0,
         "status": "OPEN",
     }
     save_manager_state()
@@ -4162,6 +4170,104 @@ def find_live_position(position_id):
         if int(position.get("position_id", 0)) == int(position_id):
             return position
     return None
+
+
+def sync_manager_with_reconcile():
+    """
+    Synchronize AI Manager state from a FRESH cTrader RECONCILE snapshot.
+
+    Important:
+    - cTrader is the source of truth.
+    - A single missing snapshot never closes a managed trade.
+    - If an old manager state says CLOSED but cTrader still contains the same
+      position_id, the manager restores it to OPEN automatically.
+    """
+    positions = ctrader_state.get("positions", []) or []
+    live_by_id = {
+        int(position.get("position_id", 0)): position
+        for position in positions
+        if int(position.get("position_id", 0) or 0) > 0
+    }
+
+    changed = False
+    now = int(time.time())
+
+    for key, trade in list(manager_state.get("active", {}).items()):
+        try:
+            position_id = int(trade.get("position_id") or key)
+        except Exception:
+            continue
+
+        live = live_by_id.get(position_id)
+
+        if live is not None:
+            was_closed = trade.get("status") == "CLOSED"
+
+            # A live cTrader position always wins over stale manager state.
+            if was_closed:
+                trade["status"] = "OPEN"
+                trade["last_managed_at"] = 0
+                print(
+                    f"[MANAGER SYNC] RESTORED OPEN position_id={position_id}",
+                    flush=True,
+                )
+                send_telegram_message(
+                    f"🔄 {trade.get('instrument', 'XAUUSD')} "
+                    f"{trade.get('side', '')} — MANAGER WZNOWIONY\n"
+                    f"Pozycja {position_id} nadal jest otwarta w cTrader.\n"
+                    f"➡️ AI Manager ponownie ją prowadzi."
+                )
+
+            trade["reconcile_misses"] = 0
+            trade["remaining_volume_raw"] = int(
+                live.get("volume_raw")
+                or trade.get("remaining_volume_raw")
+                or trade.get("initial_volume_raw")
+                or 0
+            )
+
+            live_sl = float(live.get("stop_loss") or 0.0)
+            live_tp = float(live.get("take_profit") or 0.0)
+            if live_sl:
+                trade["current_sl"] = live_sl
+            if live_tp:
+                trade["current_tp"] = live_tp
+
+            changed = True
+            continue
+
+        # Missing from ONE reconcile is not enough to declare a close.
+        if trade.get("status") in ("OPEN", "CLOSING"):
+            misses = int(trade.get("reconcile_misses") or 0) + 1
+            trade["reconcile_misses"] = misses
+            changed = True
+
+            print(
+                f"[MANAGER SYNC] position_id={position_id} missing "
+                f"from reconcile {misses}/2",
+                flush=True,
+            )
+
+            # Require two consecutive fresh reconcile snapshots. This avoids
+            # the race that previously produced false "POZYCJA ZAMKNIĘTA".
+            if misses >= 2 and now - int(trade.get("opened_at") or 0) >= 5:
+                trade["status"] = "CLOSED"
+                print(
+                    f"[MANAGER SYNC] CONFIRMED CLOSED position_id={position_id}",
+                    flush=True,
+                )
+                send_telegram_message(
+                    f"🏁 {trade['instrument']} {trade['side']} — "
+                    f"POZYCJA ZAMKNIĘTA\n"
+                    f"Entry: {float(trade['entry']):.2f}\n"
+                    f"Ostatni SL: {float(trade.get('current_sl') or 0):.2f}\n"
+                    f"TP strategii: {float(trade.get('strategy_tp') or 0):.2f}\n"
+                    f"✅ Zamknięcie potwierdzone przez 2 kolejne "
+                    f"odczyty cTrader RECONCILE."
+                )
+
+    if changed:
+        save_manager_state()
 
 
 def amend_position(position_id, stop_loss=None, take_profit=None):
@@ -4274,16 +4380,14 @@ def manage_one_trade(trade):
     position_id = int(trade["position_id"])
     live = find_live_position(position_id)
     if live is None:
-        # Po reconcile pozycja zniknęła - oznaczamy jako zamkniętą.
-        if trade.get("status") == "OPEN":
-            trade["status"] = "CLOSED"
-            send_telegram_message(
-                f"🏁 {trade['instrument']} {trade['side']} — POZYCJA ZAMKNIĘTA\n"
-                f"Entry: {trade['entry']:.2f}\nOstatni SL: {trade['current_sl']:.2f}\n"
-                f"TP strategii: {trade['strategy_tp']:.2f}\n"
-                f"Szczegółowy wynik odczyta cTrader w historii transakcji."
-            )
-            save_manager_state()
+        # Nie zamykamy managera na podstawie chwilowo pustej/starej listy.
+        # Status CLOSED może ustawić execution event albo dopiero
+        # sync_manager_with_reconcile() po 2 świeżych brakach.
+        print(
+            f"[MANAGER] WAIT position_id={position_id} "
+            f"not present in current position cache",
+            flush=True,
+        )
         return
 
     instrument = trade["instrument"]
@@ -4419,12 +4523,16 @@ def handle_execution_for_manager(response, instrument):
         execution_type = int(response.executionType)
         if execution_type != ProtoOAExecutionType.ORDER_FILLED:
             return
+        closing = bool(
+            response.HasField("order")
+            and getattr(response.order, "closingOrder", False)
+        )
+
         if response.HasField("deal"):
             deal = response.deal
             position_id = int(getattr(deal, "positionId", 0) or 0)
             execution_price = float(getattr(deal, "executionPrice", 0.0) or 0.0)
             filled_volume_raw = int(getattr(deal, "filledVolume", 0) or getattr(deal, "volume", 0) or 0)
-            closing = bool(response.HasField("order") and getattr(response.order, "closingOrder", False))
             if closing and position_id and str(position_id) in manager_state["active"]:
                 trade = manager_state["active"][str(position_id)]
                 before_remaining = int(trade.get("remaining_volume_raw") or trade.get("initial_volume_raw") or 0)
@@ -4463,7 +4571,11 @@ def handle_execution_for_manager(response, instrument):
                         f"Cel: {float(trade.get('current_tp') or 0):.2f}"
                     )
                 save_manager_state()
-        register_filled_strategy_position(response, instrument)
+
+        # Register only an ENTRY fill. A closing fill must never recreate
+        # the same position as a fresh managed trade.
+        if not closing:
+            register_filled_strategy_position(response, instrument)
     except Exception as error:
         print("[MANAGER EXEC ERROR]", error)
 
