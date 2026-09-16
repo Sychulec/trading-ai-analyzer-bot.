@@ -4015,41 +4015,16 @@ def submit_strategy_market_order(signal):
         send_telegram_message(f"⚠️ {instrument}: błędny układ cen SHORT. Cena {entry}, SL {sl}, TP {tp}.")
         return
 
-    # FTMO risk guard for TradingView entries.
-    # Do NOT use a fixed 0.50 lot size: size the position from equity and the actual strategy SL.
-    # This keeps the planned loss at the current risk tier (0.50% / 0.35% / 0.25%).
-    if daily_loss_percent() >= OWN_DAILY_STOP_PERCENT:
-        send_telegram_message(
-            f"⛔ {instrument}: STOP DZIENNY {OWN_DAILY_STOP_PERCENT:.2f}% osiągnięty. "
-            "Nowy sygnał TradingView pominięty."
-        )
-        return
-
-    if trade_state["trades_today"] >= MAX_TRADES_PER_DAY:
-        send_telegram_message(
-            f"⛔ {instrument}: limit {MAX_TRADES_PER_DAY} transakcji na dziś osiągnięty. "
-            "Nowy sygnał TradingView pominięty."
-        )
-        return
-
-    if len(ctrader_state.get("positions", [])) >= MAX_OPEN_POSITIONS:
-        send_telegram_message(
-            f"⛔ {instrument}: limit {MAX_OPEN_POSITIONS} otwartych pozycji osiągnięty."
-        )
-        return
-
-    risk = calculate_risk(current_equity())
-    sizing = size_position(instrument, entry, sl, risk["risk_usd"])
-    if not sizing.get("ok"):
-        send_telegram_message(
-            f"⚠️ {instrument}: nie mogę wyliczyć wolumenu dla ryzyka "
-            f"{risk['risk_percent']:.2f}% (${risk['risk_usd']:.2f}): {sizing.get('reason')}"
-        )
-        return
-
-    volume_raw = int(sizing["volume_raw"])
-    lots = sizing.get("lots")
-    estimated_risk_usd = float(sizing.get("estimated_risk_usd") or 0.0)
+    lots = FIXED_LOTS_XAUUSD if instrument == "XAUUSD" else 0.0
+    volume_raw = fixed_volume_for_lots(instrument, lots) if lots > 0 else None
+    if volume_raw is None:
+        # fallback do starego risk engine dla innych instrumentów
+        sizing = size_position(instrument, entry, sl, calculate_risk(current_equity())["risk_usd"])
+        if not sizing.get("ok"):
+            send_telegram_message(f"⚠️ {instrument}: nie mogę wyliczyć wolumenu: {sizing.get('reason')}")
+            return
+        volume_raw = int(sizing["volume_raw"])
+        lots = sizing.get("lots")
 
     req = ProtoOANewOrderReq()
     req.ctidTraderAccountId = int(ctrader_state["account_id"])
@@ -4075,9 +4050,6 @@ def submit_strategy_market_order(signal):
         "tp_reference": tp,
         "volume_raw": int(volume_raw),
         "lots": lots,
-        "risk_percent": risk["risk_percent"],
-        "risk_usd_limit": risk["risk_usd"],
-        "estimated_risk_usd": estimated_risk_usd,
         "status": "SENT",
         "sent_at": int(time.time()),
     }
@@ -4087,8 +4059,6 @@ def submit_strategy_market_order(signal):
         f"📥 {instrument} {signal['side']} — SYGNAŁ STRATEGII\n"
         f"Cena strategii: {entry:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
         f"Wolumen: {lots if lots is not None else '?'} lot\n"
-        f"Ryzyko: {risk['risk_percent']:.2f}% | planowane ~${estimated_risk_usd:.2f} "
-        f"(limit ${risk['risk_usd']:.2f})\n"
         f"➡️ Wysyłam MARKET do cTrader."
     )
     ctrader_client.send(req).addErrback(safe_errback)
